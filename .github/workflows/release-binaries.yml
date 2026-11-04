@@ -48,7 +48,7 @@ jobs:
       - name: Apply migration patches
         shell: bash
         run: |
-          for patch in lab/patches/*.patch; do
+          for patch in "$PWD"/lab/patches/*.patch; do
             echo "Applying $patch"
             git -C cdk apply "$patch"
           done
