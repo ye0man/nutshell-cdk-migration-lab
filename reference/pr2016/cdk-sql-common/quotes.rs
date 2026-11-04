@@ -1,0 +1,1470 @@
+﻿//! Quotes database implementation
+
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use async_trait::async_trait;
+use cdk_common::database::mint::{Acquired, LockedMeltQuotes};
+use cdk_common::database::{
+    self, ConversionError, Error, MintQuotesDatabase, MintQuotesTransaction,
+};
+use cdk_common::mint::{
+    self, IncomingPayment, Issuance, MeltPaymentRequest, MeltQuote, MintQuote, Operation,
+};
+use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
+use cdk_common::payment::PaymentIdentifier;
+use cdk_common::quote_id::QuoteId;
+use cdk_common::state::check_melt_quote_state_transition;
+use cdk_common::util::unix_time;
+use cdk_common::{
+    Amount, BlindedMessage, CurrencyUnit, Id, MeltQuoteState, PaymentMethod, PublicKey,
+};
+#[cfg(feature = "prometheus")]
+use cdk_prometheus::MintMetricGuard;
+use lightning_invoice::Bolt11Invoice;
+use tracing::instrument;
+
+use super::{SQLMintDatabase, SQLTransaction};
+use crate::database::DatabaseExecutor;
+use crate::pool::DatabasePool;
+use crate::stmt::{query, Column};
+use crate::{
+    column_as_nullable_number, column_as_nullable_string, column_as_number, column_as_string,
+    unpack_into,
+};
+
+async fn get_mint_quote_payments<C>(
+    conn: &C,
+    quote_id: &QuoteId,
+) -> Result<Vec<IncomingPayment>, Error>
+where
+    C: DatabaseExecutor + Send + Sync,
+{
+    // Get payment IDs and timestamps from the mint_quote_payments table
+    query(
+        r#"
+        SELECT
+            p.payment_id,
+            p.timestamp,
+            p.amount,
+            q.unit
+        FROM
+            mint_quote_payments p
+        JOIN mint_quote q ON p.quote_id = q.id
+        WHERE
+            p.quote_id=:quote_id
+        "#,
+    )?
+    .bind("quote_id", quote_id.to_string())
+    .fetch_all(conn)
+    .await?
+    .into_iter()
+    .map(|row| {
+        let amount: u64 = column_as_number!(row[2].clone());
+        let time: u64 = column_as_number!(row[1].clone());
+        let unit = column_as_string!(&row[3], CurrencyUnit::from_str);
+        Ok(IncomingPayment::new(
+            Amount::from(amount).with_unit(unit),
+            column_as_string!(&row[0]),
+            time,
+        ))
+    })
+    .collect()
+}
+
+async fn get_mint_quote_issuance<C>(conn: &C, quote_id: &QuoteId) -> Result<Vec<Issuance>, Error>
+where
+    C: DatabaseExecutor + Send + Sync,
+{
+    // Get payment IDs and timestamps from the mint_quote_payments table
+    query(
+        r#"
+SELECT i.amount, i.timestamp, q.unit
+FROM mint_quote_issued i
+JOIN mint_quote q ON i.quote_id = q.id
+WHERE i.quote_id=:quote_id
+            "#,
+    )?
+    .bind("quote_id", quote_id.to_string())
+    .fetch_all(conn)
+    .await?
+    .into_iter()
+    .map(|row| {
+        let time: u64 = column_as_number!(row[1].clone());
+        let unit = column_as_string!(&row[2], CurrencyUnit::from_str);
+        Ok(Issuance::new(
+            Amount::from_i64(column_as_number!(row[0].clone()))
+                .expect("Is amount when put into db")
+                .with_unit(unit),
+            time,
+        ))
+    })
+    .collect()
+}
+
+// Inline helper functions that work with both connections and transactions
+pub(super) async fn get_mint_quote_inner<T>(
+    executor: &T,
+    quote_id: &QuoteId,
+    for_update: bool,
+) -> Result<Option<MintQuote>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let for_update_clause = if for_update { "FOR UPDATE" } else { "" };
+    let query_str = format!(
+        r#"
+        SELECT
+            id,
+            amount,
+            unit,
+            request,
+            expiry,
+            request_lookup_id,
+            pubkey,
+            created_time,
+            amount_paid,
+            amount_issued,
+            updated_at,
+            last_checked,
+            payment_method,
+            request_lookup_id_kind,
+            extra_json
+        FROM
+            mint_quote
+        WHERE id = :id
+        {for_update_clause}
+        "#
+    );
+
+    let mut mint_quote = query(&query_str)?
+        .bind("id", quote_id.to_string())
+        .fetch_one(executor)
+        .await?
+        .map(|row| sql_row_to_mint_quote(row, vec![], vec![]))
+        .transpose()?;
+
+    // Read payments and issuance while the row lock is held (when for_update=true).
+    // Any concurrent writer must wait for our transaction before it can acquire its
+    // own lock, so these reads reflect the true committed state.
+    if let Some(quote) = mint_quote.as_mut() {
+        let payments = get_mint_quote_payments(executor, quote_id).await?;
+        let issuance = get_mint_quote_issuance(executor, quote_id).await?;
+        quote.payments = payments;
+        quote.issuance = issuance;
+    }
+
+    Ok(mint_quote)
+}
+
+pub(super) async fn get_mint_quote_by_request_inner<T>(
+    executor: &T,
+    request: &str,
+    for_update: bool,
+) -> Result<Option<MintQuote>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let for_update_clause = if for_update { "FOR UPDATE" } else { "" };
+    let query_str = format!(
+        r#"
+        SELECT
+            id,
+            amount,
+            unit,
+            request,
+            expiry,
+            request_lookup_id,
+            pubkey,
+            created_time,
+            amount_paid,
+            amount_issued,
+            updated_at,
+            last_checked,
+            payment_method,
+            request_lookup_id_kind,
+            extra_json
+        FROM
+            mint_quote
+        WHERE request = :request
+        {for_update_clause}
+        "#
+    );
+
+    let mut mint_quote = query(&query_str)?
+        .bind("request", request.to_string())
+        .fetch_one(executor)
+        .await?
+        .map(|row| sql_row_to_mint_quote(row, vec![], vec![]))
+        .transpose()?;
+
+    if let Some(quote) = mint_quote.as_mut() {
+        let payments = get_mint_quote_payments(executor, &quote.id).await?;
+        let issuance = get_mint_quote_issuance(executor, &quote.id).await?;
+        quote.issuance = issuance;
+        quote.payments = payments;
+    }
+
+    Ok(mint_quote)
+}
+
+pub(super) async fn get_mint_quote_by_request_lookup_id_inner<T>(
+    executor: &T,
+    request_lookup_id: &PaymentIdentifier,
+    for_update: bool,
+) -> Result<Option<MintQuote>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let for_update_clause = if for_update { "FOR UPDATE" } else { "" };
+    let query_str = format!(
+        r#"
+        SELECT
+            id,
+            amount,
+            unit,
+            request,
+            expiry,
+            request_lookup_id,
+            pubkey,
+            created_time,
+            amount_paid,
+            amount_issued,
+            updated_at,
+            last_checked,
+            payment_method,
+            request_lookup_id_kind,
+            extra_json
+        FROM
+            mint_quote
+        WHERE request_lookup_id = :request_lookup_id
+        AND request_lookup_id_kind = :request_lookup_id_kind
+        {for_update_clause}
+        "#
+    );
+
+    let mut mint_quote = query(&query_str)?
+        .bind("request_lookup_id", request_lookup_id.to_string())
+        .bind("request_lookup_id_kind", request_lookup_id.kind())
+        .fetch_one(executor)
+        .await?
+        .map(|row| sql_row_to_mint_quote(row, vec![], vec![]))
+        .transpose()?;
+
+    if let Some(quote) = mint_quote.as_mut() {
+        let payments = get_mint_quote_payments(executor, &quote.id).await?;
+        let issuance = get_mint_quote_issuance(executor, &quote.id).await?;
+        quote.issuance = issuance;
+        quote.payments = payments;
+    }
+
+    Ok(mint_quote)
+}
+
+pub(super) async fn get_melt_quote_inner<T>(
+    executor: &T,
+    quote_id: &QuoteId,
+    for_update: bool,
+) -> Result<Option<mint::MeltQuote>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let for_update_clause = if for_update { "FOR UPDATE" } else { "" };
+    let query_str = format!(
+        r#"
+        SELECT
+            id,
+            unit,
+            amount,
+            request,
+            fee_reserve,
+            expiry,
+            state,
+            payment_proof,
+            estimated_blocks,
+            request_lookup_id,
+            created_time,
+            paid_time,
+            payment_method,
+            options,
+            request_lookup_id_kind,
+            extra_json,
+            fee_options,
+            selected_fee_index
+        FROM
+            melt_quote
+        WHERE
+            id=:id
+        {for_update_clause}
+        "#
+    );
+
+    query(&query_str)?
+        .bind("id", quote_id.to_string())
+        .fetch_one(executor)
+        .await?
+        .map(sql_row_to_melt_quote)
+        .transpose()
+}
+
+pub(super) async fn get_mint_quotes_inner<T>(
+    executor: &T,
+    quote_ids: &[QuoteId],
+    for_update: bool,
+) -> Result<Vec<Option<MintQuote>>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let for_update_clause = if for_update { "FOR UPDATE" } else { "" };
+    let query_str = format!(
+        r#"
+        SELECT
+            id,
+            amount,
+            unit,
+            request,
+            expiry,
+            request_lookup_id,
+            pubkey,
+            created_time,
+            amount_paid,
+            amount_issued,
+            updated_at,
+            last_checked,
+            payment_method,
+            request_lookup_id_kind,
+            extra_json
+        FROM
+            mint_quote
+        WHERE id IN (:quote_ids)
+        ORDER BY id
+        {for_update_clause}
+        "#
+    );
+
+    let rows = query(&query_str)?
+        .bind_vec(
+            "quote_ids",
+            quote_ids.iter().map(|x| x.to_string()).collect(),
+        )?
+        .fetch_all(executor)
+        .await?;
+
+    // Build a map from quote ID to MintQuote (without payments/issuance yet)
+    let mut quote_map: HashMap<String, MintQuote> = HashMap::with_capacity(rows.len());
+
+    for row in rows {
+        let quote = sql_row_to_mint_quote(row, vec![], vec![])?;
+        quote_map.insert(quote.id.to_string(), quote);
+    }
+
+    // Now fetch payments and issuance for each found quote
+    for quote in quote_map.values_mut() {
+        let payments = get_mint_quote_payments(executor, &quote.id).await?;
+        let issuance = get_mint_quote_issuance(executor, &quote.id).await?;
+        quote.payments = payments;
+        quote.issuance = issuance;
+    }
+
+    // Reconstruct in the same order as input IDs
+    let result: Vec<Option<MintQuote>> = quote_ids
+        .iter()
+        .map(|id| quote_map.remove(&id.to_string()))
+        .collect();
+
+    Ok(result)
+}
+
+pub(super) async fn get_melt_quotes_by_request_lookup_id_inner<T>(
+    executor: &T,
+    request_lookup_id: &PaymentIdentifier,
+    for_update: bool,
+) -> Result<Vec<mint::MeltQuote>, Error>
+where
+    T: DatabaseExecutor,
+{
+    let for_update_clause = if for_update { "FOR UPDATE" } else { "" };
+    let query_str = format!(
+        r#"
+        SELECT
+            id,
+            unit,
+            amount,
+            request,
+            fee_reserve,
+            expiry,
+            state,
+            payment_proof,
+            estimated_blocks,
+            request_lookup_id,
+            created_time,
+            paid_time,
+            payment_method,
+            options,
+            request_lookup_id_kind,
+            extra_json,
+            fee_options,
+            selected_fee_index
+        FROM
+            melt_quote
+        WHERE
+            request_lookup_id = :request_lookup_id
+            AND request_lookup_id_kind = :request_lookup_id_kind
+        ORDER BY id
+        {for_update_clause}
+        "#
+    );
+
+    query(&query_str)?
+        .bind("request_lookup_id", request_lookup_id.to_string())
+        .bind("request_lookup_id_kind", request_lookup_id.kind())
+        .fetch_all(executor)
+        .await?
+        .into_iter()
+        .map(sql_row_to_melt_quote)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+/// Locks a melt quote and all related quotes atomically to prevent deadlocks.
+///
+/// This function acquires all locks in a single query with consistent ordering (by ID),
+/// preventing the circular wait condition that can occur when locks are acquired in
+/// separate queries.
+async fn lock_melt_quote_and_related_inner<T>(
+    executor: &T,
+    quote_id: &QuoteId,
+) -> Result<LockedMeltQuotes, Error>
+where
+    T: DatabaseExecutor,
+{
+    // Use a single query with subquery to atomically lock:
+    // 1. All quotes with the same request_lookup_id as the target quote, OR
+    // 2. Just the target quote if it has no request_lookup_id
+    //
+    // The ORDER BY ensures consistent lock acquisition order across transactions,
+    // preventing deadlocks.
+    let query_str = r#"
+        SELECT
+            id,
+            unit,
+            amount,
+            request,
+            fee_reserve,
+            expiry,
+            state,
+            payment_proof,
+            estimated_blocks,
+            request_lookup_id,
+            created_time,
+            paid_time,
+            payment_method,
+            options,
+            request_lookup_id_kind,
+            extra_json,
+            fee_options,
+            selected_fee_index
+        FROM
+            melt_quote
+        WHERE
+            (
+                request_lookup_id IS NOT NULL
+                AND request_lookup_id = (SELECT request_lookup_id FROM melt_quote WHERE id = :quote_id)
+                AND request_lookup_id_kind = (SELECT request_lookup_id_kind FROM melt_quote WHERE id = :quote_id)
+            )
+            OR
+            (
+                id = :quote_id
+                AND (SELECT request_lookup_id FROM melt_quote WHERE id = :quote_id) IS NULL
+            )
+        ORDER BY id
+        FOR UPDATE
+        "#;
+
+    let all_quotes: Vec<mint::MeltQuote> = query(query_str)?
+        .bind("quote_id", quote_id.to_string())
+        .fetch_all(executor)
+        .await?
+        .into_iter()
+        .map(sql_row_to_melt_quote)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Find the target quote from the locked set
+    let target_quote = all_quotes.iter().find(|q| &q.id == quote_id).cloned();
+
+    Ok(LockedMeltQuotes {
+        target: target_quote.map(|q| q.into()),
+        all_related: all_quotes.into_iter().map(|q| q.into()).collect(),
+    })
+}
+
+#[instrument(skip_all)]
+fn sql_row_to_mint_quote(
+    row: Vec<Column>,
+    payments: Vec<IncomingPayment>,
+    issueances: Vec<Issuance>,
+) -> Result<MintQuote, Error> {
+    unpack_into!(
+        let (
+            id, amount, unit, request, expiry, request_lookup_id,
+            pubkey, created_time, amount_paid, amount_issued, updated_at, last_checked,
+            payment_method,
+            request_lookup_id_kind, extra_json
+        ) = row
+    );
+
+    let request_str = column_as_string!(&request);
+    let request_lookup_id = column_as_nullable_string!(&request_lookup_id).unwrap_or_else(|| {
+        Bolt11Invoice::from_str(&request_str)
+            .map(|invoice| invoice.payment_hash().to_string())
+            .unwrap_or_else(|_| request_str.clone())
+    });
+    let request_lookup_id_kind = column_as_string!(request_lookup_id_kind);
+
+    let pubkey = column_as_nullable_string!(&pubkey)
+        .map(|pk| PublicKey::from_hex(&pk))
+        .transpose()?;
+
+    let id = column_as_string!(id);
+    let amount: Option<u64> = column_as_nullable_number!(amount);
+    let amount_paid: u64 = column_as_number!(amount_paid);
+    let amount_issued: u64 = column_as_number!(amount_issued);
+    let updated_at: u64 = column_as_number!(updated_at);
+    let last_checked: u64 = column_as_number!(last_checked);
+    let payment_method = column_as_string!(payment_method, PaymentMethod::from_str);
+    let unit = column_as_string!(unit, CurrencyUnit::from_str);
+    let extra_json = column_as_nullable_string!(&extra_json)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let mut quote = MintQuote::new(
+        Some(QuoteId::from_str(&id)?),
+        request_str,
+        unit.clone(),
+        amount.map(|a| Amount::from(a).with_unit(unit.clone())),
+        column_as_number!(expiry),
+        PaymentIdentifier::new(&request_lookup_id_kind, &request_lookup_id)
+            .map_err(|_| ConversionError::MissingParameter("Payment id".to_string()))?,
+        pubkey,
+        Amount::from(amount_paid).with_unit(unit.clone()),
+        Amount::from(amount_issued).with_unit(unit),
+        payment_method,
+        column_as_number!(created_time),
+        updated_at,
+        payments,
+        issueances,
+        extra_json,
+    );
+    quote.set_last_checked(last_checked);
+
+    Ok(quote)
+}
+
+// FIXME: Replace unwrap with proper error handling
+fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
+    unpack_into!(
+        let (
+                id,
+                unit,
+                amount,
+                request,
+                fee_reserve,
+                expiry,
+                state,
+                payment_proof,
+                estimated_blocks,
+                request_lookup_id,
+                created_time,
+                paid_time,
+                payment_method,
+                options,
+                request_lookup_id_kind,
+                extra_json,
+                fee_options,
+                selected_fee_index
+        ) = row
+    );
+
+    let id = column_as_string!(id);
+    let amount: u64 = column_as_number!(amount);
+    let fee_reserve: u64 = column_as_number!(fee_reserve);
+
+    let expiry = column_as_number!(expiry);
+    let payment_proof = column_as_nullable_string!(payment_proof);
+    let options = column_as_nullable_string!(options);
+    let options = options.and_then(|o| serde_json::from_str(&o).ok());
+    let created_time: i64 = column_as_number!(created_time);
+    let paid_time = column_as_nullable_number!(paid_time);
+    let payment_method = PaymentMethod::from_str(&column_as_string!(payment_method))?;
+    let extra_json = column_as_nullable_string!(&extra_json)
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let fee_options = column_as_nullable_string!(&fee_options)
+        .and_then(|value| serde_json::from_str::<Vec<MeltQuoteOnchainFeeOption>>(&value).ok())
+        .unwrap_or_default();
+    let selected_fee_index: Option<u32> = column_as_nullable_number!(selected_fee_index);
+
+    let state =
+        MeltQuoteState::from_str(&column_as_string!(&state)).map_err(ConversionError::from)?;
+    let estimated_blocks: Option<u32> = column_as_nullable_number!(estimated_blocks);
+
+    let unit = column_as_string!(unit);
+    let request = column_as_string!(request);
+
+    let request_lookup_id_kind = column_as_nullable_string!(request_lookup_id_kind);
+
+    let request_lookup_id = column_as_nullable_string!(&request_lookup_id).or_else(|| {
+        Bolt11Invoice::from_str(&request)
+            .ok()
+            .map(|invoice| invoice.payment_hash().to_string())
+    });
+
+    let request_lookup_id = if let (Some(id_kind), Some(request_lookup_id)) =
+        (request_lookup_id_kind, request_lookup_id)
+    {
+        Some(
+            PaymentIdentifier::new(&id_kind, &request_lookup_id)
+                .map_err(|_| ConversionError::MissingParameter("Payment id".to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let request = match serde_json::from_str(&request) {
+        Ok(req) => req,
+        Err(err) => {
+            tracing::debug!(
+                "Melt quote from pre migrations defaulting to bolt11 {}.",
+                err
+            );
+            let bolt11 = Bolt11Invoice::from_str(&request)
+                .map_err(|e| Error::Internal(format!("Could not parse invoice: {e}")))?;
+            MeltPaymentRequest::Bolt11 { bolt11 }
+        }
+    };
+
+    let unit = CurrencyUnit::from_str(&unit)?;
+    MeltQuote::from_db(
+        QuoteId::from_str(&id)?,
+        unit,
+        request,
+        amount,
+        fee_reserve,
+        state,
+        expiry,
+        payment_proof,
+        request_lookup_id,
+        options,
+        created_time as u64,
+        paid_time,
+        payment_method,
+        extra_json,
+        estimated_blocks,
+        fee_options,
+        selected_fee_index,
+    )
+    .map_err(|e| Error::Internal(format!("Invalid onchain melt quote row: {e}")))
+}
+
+#[async_trait]
+impl<RM> MintQuotesTransaction for SQLTransaction<RM>
+where
+    RM: DatabasePool + 'static,
+{
+    type Err = Error;
+
+    async fn add_melt_request(
+        &mut self,
+        quote_id: &QuoteId,
+        inputs_amount: Amount<CurrencyUnit>,
+        inputs_fee: Amount<CurrencyUnit>,
+    ) -> Result<(), Self::Err> {
+        // Insert melt_request
+        query(
+            r#"
+            INSERT INTO melt_request
+            (quote_id, inputs_amount, inputs_fee)
+            VALUES
+            (:quote_id, :inputs_amount, :inputs_fee)
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .bind("inputs_amount", inputs_amount.to_i64())
+        .bind("inputs_fee", inputs_fee.to_i64())
+        .execute(&self.inner)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn add_blinded_messages(
+        &mut self,
+        quote_id: Option<&QuoteId>,
+        blinded_messages: &[BlindedMessage],
+        operation: &Operation,
+    ) -> Result<(), Self::Err> {
+        let current_time = unix_time();
+
+        let mut ordered_messages = blinded_messages.iter().enumerate().collect::<Vec<_>>();
+        ordered_messages.sort_unstable_by(|(_, left), (_, right)| {
+            left.blinded_secret
+                .to_bytes()
+                .cmp(&right.blinded_secret.to_bytes())
+        });
+
+        // Insert blinded_messages directly into blind_signature with c = NULL
+        // Let the database constraint handle duplicate detection
+        for (i, message) in ordered_messages {
+            match query(
+                r#"
+                INSERT INTO blind_signature
+                (blinded_message, amount, keyset_id, c, quote_id, created_time, operation_kind, operation_id, order_index)
+                VALUES
+                (:blinded_message, :amount, :keyset_id, NULL, :quote_id, :created_time, :operation_kind, :operation_id, :order_index)
+                "#,
+            )?
+            .bind(
+                "blinded_message",
+                message.blinded_secret.to_bytes().to_vec(),
+            )
+            .bind("amount", message.amount.to_i64())
+            .bind("keyset_id", message.keyset_id.to_string())
+            .bind("quote_id", quote_id.map(|q| q.to_string()))
+            .bind("created_time", current_time as i64)
+            .bind("operation_kind", operation.kind().to_string())
+            .bind("operation_id", operation.id().to_string())
+            .bind("order_index", i as i64)
+            .execute(&self.inner)
+            .await
+            {
+                Ok(_) => continue,
+                Err(database::Error::Duplicate) => {
+                    // Primary key constraint violation - blinded message already exists
+                    // This could be either:
+                    // 1. Already signed (c IS NOT NULL) - definitely an error
+                    // 2. Already pending (c IS NULL) - also an error
+                    return Err(database::Error::Duplicate);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn add_blinded_messages_with_order(
+        &mut self,
+        quote_id: Option<&QuoteId>,
+        blinded_messages: &[BlindedMessage],
+        operation: &Operation,
+        order_indexes: &[u64],
+    ) -> Result<(), Self::Err> {
+        if blinded_messages.len() != order_indexes.len() {
+            return Err(database::Error::Internal(
+                "Mismatched array lengths for blinded messages and order indexes".to_string(),
+            ));
+        }
+        self.add_blinded_messages(quote_id, blinded_messages, operation)
+            .await?;
+        for (message, order_index) in blinded_messages.iter().zip(order_indexes) {
+            query("UPDATE blind_signature SET order_index = :order_index WHERE blinded_message = :blinded_message")?
+                .bind("order_index", *order_index as i64)
+                .bind("blinded_message", message.blinded_secret.to_bytes().to_vec())
+                .execute(&self.inner)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_blinded_messages(
+        &mut self,
+        blinded_secrets: &[PublicKey],
+    ) -> Result<(), Self::Err> {
+        // Acquire all affected row locks in primary-key order before deleting.
+        query(
+            r#"
+            SELECT blinded_message
+            FROM blind_signature
+            WHERE blinded_message IN (:blinded_secrets) AND c IS NULL
+            ORDER BY blinded_message
+            FOR UPDATE
+            "#,
+        )?
+        .bind_vec(
+            "blinded_secrets",
+            blinded_secrets
+                .iter()
+                .map(|secret| secret.to_bytes().to_vec())
+                .collect(),
+        )?
+        .fetch_all(&self.inner)
+        .await?;
+
+        // Delete blinded messages from blind_signature table where c IS NULL
+        // (only delete unsigned blinded messages)
+        query(
+            r#"
+            DELETE FROM blind_signature
+            WHERE blinded_message IN (:blinded_secrets) AND c IS NULL
+            "#,
+        )?
+        .bind_vec(
+            "blinded_secrets",
+            blinded_secrets
+                .iter()
+                .map(|secret| secret.to_bytes().to_vec())
+                .collect(),
+        )?
+        .execute(&self.inner)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_melt_request_and_blinded_messages(
+        &mut self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<database::mint::MeltRequestInfo>, Self::Err> {
+        let melt_request_row = query(
+            r#"
+            SELECT mr.inputs_amount, mr.inputs_fee, mq.unit
+            FROM melt_request mr
+            JOIN melt_quote mq ON mr.quote_id = mq.id
+            WHERE mr.quote_id = :quote_id
+            FOR UPDATE
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .fetch_one(&self.inner)
+        .await?;
+
+        if let Some(row) = melt_request_row {
+            let inputs_amount: u64 = column_as_number!(row[0].clone());
+            let inputs_fee: u64 = column_as_number!(row[1].clone());
+            let unit_str = column_as_string!(&row[2]);
+            let unit = CurrencyUnit::from_str(&unit_str)?;
+
+            let blinded_messages_rows = query(
+                r#"
+                SELECT blinded_message, keyset_id, amount
+                FROM blind_signature
+                WHERE quote_id = :quote_id AND c IS NULL
+                ORDER BY order_index ASC, blinded_message ASC
+                FOR UPDATE
+                "#,
+            )?
+            .bind("quote_id", quote_id.to_string())
+            .fetch_all(&self.inner)
+            .await?;
+
+            let blinded_messages: Result<Vec<BlindedMessage>, Error> = blinded_messages_rows
+                .into_iter()
+                .map(|row| -> Result<BlindedMessage, Error> {
+                    let blinded_message_key =
+                        column_as_string!(&row[0], PublicKey::from_hex, PublicKey::from_slice);
+                    let keyset_id = column_as_string!(&row[1], Id::from_str, Id::from_bytes);
+                    let amount: u64 = column_as_number!(row[2].clone());
+
+                    Ok(BlindedMessage {
+                        blinded_secret: blinded_message_key,
+                        keyset_id,
+                        amount: Amount::from(amount),
+                        witness: None, // Not storing witness in database currently
+                    })
+                })
+                .collect();
+            let blinded_messages = blinded_messages?;
+
+            Ok(Some(database::mint::MeltRequestInfo {
+                inputs_amount: Amount::from(inputs_amount).with_unit(unit.clone()),
+                inputs_fee: Amount::from(inputs_fee).with_unit(unit),
+                change_outputs: blinded_messages,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_melt_request(&mut self, quote_id: &QuoteId) -> Result<(), Self::Err> {
+        // Delete from melt_request table
+        query(
+            r#"
+            DELETE FROM melt_request
+            WHERE quote_id = :quote_id
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .execute(&self.inner)
+        .await?;
+
+        // Match the lock order used when change outputs are loaded for
+        // finalization before deleting any still-unsigned rows.
+        query(
+            r#"
+            SELECT blinded_message
+            FROM blind_signature
+            WHERE quote_id = :quote_id AND c IS NULL
+            ORDER BY order_index ASC, blinded_message ASC
+            FOR UPDATE
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .fetch_all(&self.inner)
+        .await?;
+
+        // Also delete blinded messages (where c IS NULL) from blind_signature table
+        query(
+            r#"
+            DELETE FROM blind_signature
+            WHERE quote_id = :quote_id AND c IS NULL
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .execute(&self.inner)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn update_mint_quote(
+        &mut self,
+        quote: &mut Acquired<mint::MintQuote>,
+    ) -> Result<(), Self::Err> {
+        let mut changes = if let Some(changes) = quote.take_changes() {
+            changes
+        } else {
+            return Ok(());
+        };
+
+        if changes.issuances.is_none() && changes.payments.is_none() {
+            return Ok(());
+        }
+
+        for payment in changes.payments.take().unwrap_or_default() {
+            query(
+                r#"
+                INSERT INTO mint_quote_payments
+                (quote_id, payment_id, amount, timestamp)
+                VALUES (:quote_id, :payment_id, :amount, :timestamp)
+                "#,
+            )?
+            .bind("quote_id", quote.id.to_string())
+            .bind("payment_id", payment.payment_id)
+            .bind("amount", payment.amount.to_i64())
+            .bind("timestamp", payment.time as i64)
+            .execute(&self.inner)
+            .await
+            .map_err(|err| {
+                tracing::error!("SQLite could not insert payment ID: {}", err);
+                err
+            })?;
+        }
+
+        let current_time = unix_time();
+
+        for amount_issued in changes.issuances.take().unwrap_or_default() {
+            query(
+                r#"
+                INSERT INTO mint_quote_issued
+                (quote_id, amount, timestamp)
+                VALUES (:quote_id, :amount, :timestamp);
+                "#,
+            )?
+            .bind("quote_id", quote.id.to_string())
+            .bind("amount", amount_issued.to_i64())
+            .bind("timestamp", current_time as i64)
+            .execute(&self.inner)
+            .await?;
+        }
+
+        query(
+            r#"
+            UPDATE
+                mint_quote
+            SET
+                amount_issued = :amount_issued,
+                amount_paid = :amount_paid,
+                updated_at = CASE
+                    WHEN :current_time > updated_at + 1 THEN :current_time
+                    ELSE updated_at + 1
+                END
+            WHERE
+                id = :quote_id
+            "#,
+        )?
+        .bind("quote_id", quote.id.to_string())
+        .bind("amount_issued", quote.amount_issued().to_i64())
+        .bind("amount_paid", quote.amount_paid().to_i64())
+        .bind("current_time", current_time as i64)
+        .execute(&self.inner)
+        .await
+        .inspect_err(|err| {
+            tracing::error!("SQL could not update mint quote accounting: {}", err);
+        })?;
+
+        let updated_at = query(
+            r#"
+            SELECT updated_at
+            FROM mint_quote
+            WHERE id = :quote_id
+            "#,
+        )?
+        .bind("quote_id", quote.id.to_string())
+        .pluck(&self.inner)
+        .await?
+        .map(|updated_at| Ok::<_, Error>(column_as_number!(updated_at)))
+        .transpose()?
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "mint quote {} missing after accounting update",
+                quote.id
+            ))
+        })?;
+
+        quote.set_updated_at(updated_at);
+
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn add_mint_quote(&mut self, quote: MintQuote) -> Result<Acquired<MintQuote>, Self::Err> {
+        query(
+            r#"
+                INSERT INTO mint_quote (
+                    id, amount, unit, request, expiry, request_lookup_id, pubkey,
+                    created_time, updated_at, last_checked, payment_method,
+                    request_lookup_id_kind, extra_json
+                )
+                VALUES (
+                    :id, :amount, :unit, :request, :expiry, :request_lookup_id, :pubkey,
+                    :created_time, :updated_at, :last_checked, :payment_method,
+                    :request_lookup_id_kind, :extra_json
+                )
+            "#,
+        )?
+        .bind("id", quote.id.to_string())
+        .bind("amount", quote.amount.clone().map(|a| a.to_i64()))
+        .bind("unit", quote.unit.to_string())
+        .bind("request", quote.request.clone())
+        .bind("expiry", quote.expiry as i64)
+        .bind("request_lookup_id", quote.request_lookup_id.to_string())
+        .bind("pubkey", quote.pubkey.map(|p| p.to_string()))
+        .bind("created_time", quote.created_time as i64)
+        .bind("updated_at", quote.updated_at() as i64)
+        .bind("last_checked", quote.last_checked() as i64)
+        .bind("payment_method", quote.payment_method.to_string())
+        .bind("request_lookup_id_kind", quote.request_lookup_id.kind())
+        .bind(
+            "extra_json",
+            quote.extra_json.as_ref().map(|v| v.to_string()),
+        )
+        .execute(&self.inner)
+        .await?;
+
+        Ok(quote.into())
+    }
+
+    async fn add_melt_quote(&mut self, quote: mint::MeltQuote) -> Result<(), Self::Err> {
+        // `fee_options` is captured by value here so the subsequent chained
+        // binds can move fields out of `quote` without a borrow conflict.
+        // It is also never rewritten after insert (see the UPDATE queries
+        // below) ΓÇö the NUT rule "fixed for the lifetime of the quote" is
+        // enforced by never touching this column on update.
+        let fee_options_json = serde_json::to_string(quote.fee_options()).ok();
+
+        // Now insert the new quote
+        query(
+            r#"
+            INSERT INTO melt_quote
+            (
+                id, unit, amount, request, fee_reserve, state,
+                expiry, payment_proof, estimated_blocks, fee_options, selected_fee_index,
+                request_lookup_id, created_time, paid_time, options, request_lookup_id_kind,
+                payment_method, extra_json
+            )
+            VALUES
+            (
+                :id, :unit, :amount, :request, :fee_reserve, :state,
+                :expiry, :payment_proof, :estimated_blocks, :fee_options, :selected_fee_index,
+                :request_lookup_id, :created_time, :paid_time, :options, :request_lookup_id_kind,
+                :payment_method, :extra_json
+            )
+        "#,
+        )?
+        .bind("id", quote.id.to_string())
+        .bind("unit", quote.unit.to_string())
+        .bind("amount", quote.amount().to_i64())
+        .bind("request", serde_json::to_string(&quote.request)?)
+        .bind("fee_reserve", quote.fee_reserve().to_i64())
+        .bind("state", quote.state.to_string())
+        .bind("expiry", quote.expiry as i64)
+        .bind("payment_proof", quote.payment_proof)
+        .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+        .bind("fee_options", fee_options_json)
+        .bind(
+            "selected_fee_index",
+            quote.selected_fee_index.map(i64::from),
+        )
+        .bind(
+            "request_lookup_id",
+            quote.request_lookup_id.as_ref().map(|id| id.to_string()),
+        )
+        .bind("created_time", quote.created_time as i64)
+        .bind("paid_time", quote.paid_time.map(|t| t as i64))
+        .bind(
+            "options",
+            quote.options.map(|o| serde_json::to_string(&o).ok()),
+        )
+        .bind(
+            "request_lookup_id_kind",
+            quote.request_lookup_id.map(|id| id.kind()),
+        )
+        .bind("payment_method", quote.payment_method.to_string())
+        .bind(
+            "extra_json",
+            quote.extra_json.as_ref().map(|value| value.to_string()),
+        )
+        .execute(&self.inner)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn update_melt_quote_request_lookup_id(
+        &mut self,
+        quote: &mut Acquired<mint::MeltQuote>,
+        new_request_lookup_id: &PaymentIdentifier,
+    ) -> Result<(), Self::Err> {
+        query(r#"UPDATE melt_quote SET request_lookup_id = :new_req_id, request_lookup_id_kind = :new_kind WHERE id = :id"#)?
+            .bind("new_req_id", new_request_lookup_id.to_string())
+            .bind("new_kind", new_request_lookup_id.kind())
+            .bind("id", quote.id.to_string())
+            .execute(&self.inner)
+            .await?;
+        quote.request_lookup_id = Some(new_request_lookup_id.clone());
+        Ok(())
+    }
+
+    async fn update_melt_quote_state(
+        &mut self,
+        quote: &mut Acquired<mint::MeltQuote>,
+        state: MeltQuoteState,
+        payment_proof: Option<String>,
+    ) -> Result<MeltQuoteState, Self::Err> {
+        let old_state = quote.state;
+
+        check_melt_quote_state_transition(old_state, state)?;
+
+        // NOTE: `fee_options` is intentionally omitted from both UPDATE
+        // queries below. Per the NUT spec the returned `fee_options` are
+        // fixed for the lifetime of the quote, so we never rewrite them
+        // after insert. Only state/paid_time/payment_proof/fee_reserve/
+        // estimated_blocks/selected_fee_index may change over the
+        // quote's lifetime.
+        let rec = if state == MeltQuoteState::Paid {
+            let current_time = unix_time();
+            quote.paid_time = Some(current_time);
+            quote.payment_proof = payment_proof.clone();
+            query(r#"UPDATE melt_quote SET state = :state, paid_time = :paid_time, payment_proof = :payment_proof, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index WHERE id = :id"#)?
+                .bind("state", state.to_string())
+                .bind("paid_time", current_time as i64)
+                .bind("payment_proof", payment_proof)
+                .bind("fee_reserve", quote.fee_reserve().value() as i64)
+                .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+                .bind("selected_fee_index", quote.selected_fee_index.map(i64::from))
+                .bind("id", quote.id.to_string())
+                .execute(&self.inner)
+                .await
+        } else {
+            query(r#"UPDATE melt_quote SET state = :state, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index WHERE id = :id"#)?
+                .bind("state", state.to_string())
+                .bind("fee_reserve", quote.fee_reserve().value() as i64)
+                .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+                .bind("selected_fee_index", quote.selected_fee_index.map(i64::from))
+                .bind("id", quote.id.to_string())
+                .execute(&self.inner)
+                .await
+        };
+
+        match rec {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!("SQLite Could not update melt quote");
+                return Err(err);
+            }
+        };
+
+        quote.state = state;
+
+        if state == MeltQuoteState::Unpaid || state == MeltQuoteState::Failed {
+            self.delete_melt_request(&quote.id).await?;
+        }
+
+        Ok(old_state)
+    }
+
+    async fn get_mint_quote(
+        &mut self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<Acquired<MintQuote>>, Self::Err> {
+        get_mint_quote_inner(&self.inner, quote_id, true)
+            .await
+            .map(|quote| quote.map(|inner| inner.into()))
+    }
+
+    async fn get_mint_quotes_by_ids(
+        &mut self,
+        quote_ids: &[QuoteId],
+    ) -> Result<Vec<Option<Acquired<MintQuote>>>, Self::Err> {
+        get_mint_quotes_inner(&self.inner, quote_ids, true)
+            .await
+            .map(|quotes| {
+                quotes
+                    .into_iter()
+                    .map(|quote| quote.map(|inner| inner.into()))
+                    .collect()
+            })
+    }
+
+    async fn get_melt_quote(
+        &mut self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<Acquired<mint::MeltQuote>>, Self::Err> {
+        get_melt_quote_inner(&self.inner, quote_id, true)
+            .await
+            .map(|quote| quote.map(|inner| inner.into()))
+    }
+
+    async fn get_melt_quotes_by_request_lookup_id(
+        &mut self,
+        request_lookup_id: &PaymentIdentifier,
+    ) -> Result<Vec<Acquired<mint::MeltQuote>>, Self::Err> {
+        get_melt_quotes_by_request_lookup_id_inner(&self.inner, request_lookup_id, true)
+            .await
+            .map(|quote| quote.into_iter().map(|inner| inner.into()).collect())
+    }
+
+    async fn lock_melt_quote_and_related(
+        &mut self,
+        quote_id: &QuoteId,
+    ) -> Result<LockedMeltQuotes, Self::Err> {
+        lock_melt_quote_and_related_inner(&self.inner, quote_id).await
+    }
+
+    async fn get_mint_quote_by_request(
+        &mut self,
+        request: &str,
+    ) -> Result<Option<Acquired<MintQuote>>, Self::Err> {
+        get_mint_quote_by_request_inner(&self.inner, request, true)
+            .await
+            .map(|quote| quote.map(|inner| inner.into()))
+    }
+
+    async fn get_mint_quote_by_request_lookup_id(
+        &mut self,
+        request_lookup_id: &PaymentIdentifier,
+    ) -> Result<Option<Acquired<MintQuote>>, Self::Err> {
+        get_mint_quote_by_request_lookup_id_inner(&self.inner, request_lookup_id, true)
+            .await
+            .map(|quote| quote.map(|inner| inner.into()))
+    }
+}
+
+#[async_trait]
+impl<RM> MintQuotesDatabase for SQLMintDatabase<RM>
+where
+    RM: DatabasePool + 'static,
+{
+    type Err = Error;
+
+    async fn get_mint_quote(&self, quote_id: &QuoteId) -> Result<Option<MintQuote>, Self::Err> {
+        #[cfg(feature = "prometheus")]
+        let metrics = MintMetricGuard::new("get_mint_quote");
+
+        let result = async {
+            let conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| Error::Database(Box::new(e)))?;
+            get_mint_quote_inner(&*conn, quote_id, false).await
+        }
+        .await;
+
+        #[cfg(feature = "prometheus")]
+        {
+            metrics.record(result.is_ok());
+        }
+
+        result
+    }
+
+    async fn try_update_mint_quote_last_checked(
+        &self,
+        quote_id: &QuoteId,
+        last_checked: u64,
+        min_interval: u64,
+    ) -> Result<bool, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let threshold = last_checked.saturating_sub(min_interval);
+        let rows_affected = query(
+            r#"
+            UPDATE mint_quote
+            SET last_checked = :last_checked
+            WHERE id = :quote_id
+              AND last_checked < :threshold
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .bind("last_checked", last_checked as i64)
+        .bind("threshold", threshold as i64)
+        .execute(&*conn)
+        .await?;
+
+        Ok(rows_affected > 0)
+    }
+
+    async fn get_mint_quotes_by_ids(
+        &self,
+        quote_ids: &[QuoteId],
+    ) -> Result<Vec<Option<MintQuote>>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        get_mint_quotes_inner(&*conn, quote_ids, false).await
+    }
+
+    async fn get_mint_quote_by_request(
+        &self,
+        request: &str,
+    ) -> Result<Option<MintQuote>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        get_mint_quote_by_request_inner(&*conn, request, false).await
+    }
+
+    async fn get_mint_quote_by_request_lookup_id(
+        &self,
+        request_lookup_id: &PaymentIdentifier,
+    ) -> Result<Option<MintQuote>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        get_mint_quote_by_request_lookup_id_inner(&*conn, request_lookup_id, false).await
+    }
+
+    async fn get_mint_quotes(&self) -> Result<Vec<MintQuote>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let mut mint_quotes = query(
+            r#"
+            SELECT
+                id,
+                amount,
+                unit,
+                request,
+                expiry,
+                request_lookup_id,
+                pubkey,
+                created_time,
+                amount_paid,
+                amount_issued,
+                updated_at,
+                last_checked,
+                payment_method,
+                request_lookup_id_kind,
+                extra_json
+            FROM
+                mint_quote
+            "#,
+        )?
+        .fetch_all(&*conn)
+        .await?
+        .into_iter()
+        .map(|row| sql_row_to_mint_quote(row, vec![], vec![]))
+        .collect::<Result<Vec<_>, _>>()?;
+
+        for quote in mint_quotes.as_mut_slice() {
+            let payments = get_mint_quote_payments(&*conn, &quote.id).await?;
+            let issuance = get_mint_quote_issuance(&*conn, &quote.id).await?;
+            quote.issuance = issuance;
+            quote.payments = payments;
+        }
+
+        Ok(mint_quotes)
+    }
+
+    async fn get_melt_quote(
+        &self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<mint::MeltQuote>, Self::Err> {
+        #[cfg(feature = "prometheus")]
+        let metrics = MintMetricGuard::new("get_melt_quote");
+
+        let result = async {
+            let conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| Error::Database(Box::new(e)))?;
+            get_melt_quote_inner(&*conn, quote_id, false).await
+        }
+        .await;
+
+        #[cfg(feature = "prometheus")]
+        {
+            metrics.record(result.is_ok());
+        }
+
+        result
+    }
+
+    async fn get_melt_quotes(&self) -> Result<Vec<mint::MeltQuote>, Self::Err> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        Ok(query(
+            r#"
+            SELECT
+                id,
+                unit,
+                amount,
+                request,
+                fee_reserve,
+                expiry,
+                state,
+                payment_proof,
+                estimated_blocks,
+                request_lookup_id,
+                created_time,
+                paid_time,
+                payment_method,
+                options,
+                request_lookup_id_kind,
+                extra_json,
+                fee_options,
+                selected_fee_index
+            FROM
+                melt_quote
+            "#,
+        )?
+        .fetch_all(&*conn)
+        .await?
+        .into_iter()
+        .map(sql_row_to_melt_quote)
+        .collect::<Result<Vec<_>, _>>()?)
+    }
+}

@@ -1,0 +1,132 @@
+From ce7c071f0f2cc3a022ba7e3f6fde98882314a38a Mon Sep 17 00:00:00 2001
+From: ye0man <jakeyoungman14@gmail.com>
+Date: Wed, 4 Nov 2026 15:59:18 +0900
+Subject: [PATCH 1/5] feat(db): add order-aware promise inserts for migrations
+
+---
+ crates/cdk-common/src/database/mint/mod.rs   | 26 ++++++++++++++++++++
+ crates/cdk-sql-common/src/mint/quotes.rs     | 26 ++++++++++++++++++++
+ crates/cdk-sql-common/src/mint/signatures.rs | 26 ++++++++++++++++++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/crates/cdk-common/src/database/mint/mod.rs b/crates/cdk-common/src/database/mint/mod.rs
+index 5e9871d2..5401ffe1 100644
+--- a/crates/cdk-common/src/database/mint/mod.rs
++++ b/crates/cdk-common/src/database/mint/mod.rs
+@@ -226,6 +226,19 @@ pub trait QuotesTransaction {
+         operation: &Operation,
+     ) -> Result<(), Self::Err>;
+ 
++    /// Add blinded messages while preserving their original persisted order.
++    async fn add_blinded_messages_with_order(
++        &mut self,
++        quote_id: Option<&QuoteId>,
++        blinded_messages: &[BlindedMessage],
++        operation: &Operation,
++        order_indexes: &[u64],
++    ) -> Result<(), Self::Err> {
++        let _ = order_indexes;
++        self.add_blinded_messages(quote_id, blinded_messages, operation)
++            .await
++    }
++
+     /// Delete blinded_messages by their blinded secrets
+     async fn delete_blinded_messages(
+         &mut self,
+@@ -526,6 +539,19 @@ pub trait SignaturesTransaction {
+         quote_id: Option<QuoteId>,
+     ) -> Result<(), Self::Err>;
+ 
++    /// Add blind signatures while preserving their original persisted order.
++    async fn add_blind_signatures_with_order(
++        &mut self,
++        blinded_messages: &[PublicKey],
++        blind_signatures: &[BlindSignature],
++        quote_id: Option<QuoteId>,
++        order_indexes: &[u64],
++    ) -> Result<(), Self::Err> {
++        let _ = order_indexes;
++        self.add_blind_signatures(blinded_messages, blind_signatures, quote_id)
++            .await
++    }
++
+     /// Get [`BlindSignature`]s
+     async fn get_blind_signatures(
+         &mut self,
+diff --git a/crates/cdk-sql-common/src/mint/quotes.rs b/crates/cdk-sql-common/src/mint/quotes.rs
+index df427e7a..aa4af04e 100644
+--- a/crates/cdk-sql-common/src/mint/quotes.rs
++++ b/crates/cdk-sql-common/src/mint/quotes.rs
+@@ -749,6 +749,32 @@ where
+         Ok(())
+     }
+ 
++    async fn add_blinded_messages_with_order(
++        &mut self,
++        quote_id: Option<&QuoteId>,
++        blinded_messages: &[BlindedMessage],
++        operation: &Operation,
++        order_indexes: &[u64],
++    ) -> Result<(), Self::Err> {
++        if blinded_messages.len() != order_indexes.len() {
++            return Err(database::Error::Internal(
++                "Mismatched array lengths for blinded messages and order indexes".to_string(),
++            ));
++        }
++        self.add_blinded_messages(quote_id, blinded_messages, operation)
++            .await?;
++        for (message, order_index) in blinded_messages.iter().zip(order_indexes) {
++            query(
++                "UPDATE blind_signature SET order_index = :order_index WHERE blinded_message = :blinded_message",
++            )?
++            .bind("order_index", *order_index as i64)
++            .bind("blinded_message", message.blinded_secret.to_bytes().to_vec())
++            .execute(&self.inner)
++            .await?;
++        }
++        Ok(())
++    }
++
+     async fn delete_blinded_messages(
+         &mut self,
+         blinded_secrets: &[PublicKey],
+diff --git a/crates/cdk-sql-common/src/mint/signatures.rs b/crates/cdk-sql-common/src/mint/signatures.rs
+index 46020c08..e67d48fc 100644
+--- a/crates/cdk-sql-common/src/mint/signatures.rs
++++ b/crates/cdk-sql-common/src/mint/signatures.rs
+@@ -216,6 +216,32 @@ where
+         Ok(())
+     }
+ 
++    async fn add_blind_signatures_with_order(
++        &mut self,
++        blinded_messages: &[PublicKey],
++        blind_signatures: &[BlindSignature],
++        quote_id: Option<QuoteId>,
++        order_indexes: &[u64],
++    ) -> Result<(), Self::Err> {
++        if blinded_messages.len() != order_indexes.len() {
++            return Err(database::Error::Internal(
++                "Mismatched array lengths for blinded messages and order indexes".to_string(),
++            ));
++        }
++        self.add_blind_signatures(blinded_messages, blind_signatures, quote_id)
++            .await?;
++        for (message, order_index) in blinded_messages.iter().zip(order_indexes) {
++            query(
++                "UPDATE blind_signature SET order_index = :order_index WHERE blinded_message = :blinded_message",
++            )?
++            .bind("order_index", *order_index as i64)
++            .bind("blinded_message", message.to_bytes().to_vec())
++            .execute(&self.inner)
++            .await?;
++        }
++        Ok(())
++    }
++
+     async fn get_blind_signatures(
+         &mut self,
+         blinded_messages: &[PublicKey],
+-- 
+2.50.1.windows.1
+

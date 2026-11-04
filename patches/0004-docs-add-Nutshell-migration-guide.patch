@@ -1,0 +1,88 @@
+From 305ef388203c91097626aff210f6a6e29ef71f97 Mon Sep 17 00:00:00 2001
+From: ye0man <jakeyoungman14@gmail.com>
+Date: Wed, 4 Nov 2026 15:59:25 +0900
+Subject: [PATCH 4/5] docs: add Nutshell migration guide
+
+---
+ docs/nutshell-migration.md | 69 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+ create mode 100644 docs/nutshell-migration.md
+
+diff --git a/docs/nutshell-migration.md b/docs/nutshell-migration.md
+new file mode 100644
+index 00000000..a7c2f13b
+--- /dev/null
++++ b/docs/nutshell-migration.md
+@@ -0,0 +1,69 @@
++# Migrating a Nutshell mint to CDK
++
++`cdk-mintd migrate-nutshell` copies a Nutshell mint database into an empty CDK
++database of the same engine. It is an offline operation: stop the Nutshell mint
++and keep it stopped until cutover.
++
++This subcommand is not part of the stock v0.18.3 release. It is a port of the
++closed PR #2016, extended for Nutshell 0.20.3 through 0.22.x.
++
++## SQLite
++
++```bash
++cdk-mintd migrate-nutshell \
++  --source /path/to/nutshell/mint.sqlite3 \
++  --target /var/lib/cdk-mintd/cdk-mintd.sqlite \
++  --allow-empty-c
++```
++
++The target path must not exist. The migration writes a staging database and
++renames it only after verification succeeds.
++
++## PostgreSQL
++
++```bash
++cdk-mintd migrate-nutshell \
++  --source 'postgres://nutshell:password@127.0.0.1:5432/nutshell' \
++  --target 'postgres://cdk:password@127.0.0.1:5432/cdk_mint' \
++  --tls-mode disable \
++  --allow-empty-c
++```
++
++The target database must exist and be empty. The tool applies the CDK schema.
++
++## Options
++
++| Option | Meaning |
++|---|---|
++| `--source <path-or-url>` | Nutshell SQLite path or PostgreSQL URL |
++| `--target <path-or-url>` | Empty CDK SQLite path or PostgreSQL URL |
++| `--tls-mode <mode>` | PostgreSQL TLS mode for the target |
++| `--verify-only` | Verify an existing migration without writing |
++| `--allow-empty-c` | Replace an empty `C` on spent proofs with the generator |
++| `--allow-orphans` | Skip rows whose keyset is missing from `keysets` |
++| `--allow-unknown-schema` | Accept a schema outside 38-42 |
++
++## Verification
++
++The migration performs a verification pass before committing. Run it again
++without writing:
++
++```bash
++cdk-mintd migrate-nutshell --source ... --target ... --verify-only
++```
++
++## After migration
++
++Initialize the database-backed configuration with the original seed:
++
++```bash
++cdk-mintd --work-dir /var/lib/cdk-mintd config init --existing-mint --file config.toml
++cdk-mintd --work-dir /var/lib/cdk-mintd
++```
++
++CDK verifies the configured signer against the historical keysets. Preserve the
++original `MINT_MNEMONIC` as `[info].mnemonic` or the original
++`MINT_PRIVATE_KEY` / raw seed as `[info].seed`. Do not convert between them.
++
++On first start CDK rotates each unit's active keyset because Nutshell keysets use
++64 amounts and CDK uses 32. Old keysets remain valid for spending.
+-- 
+2.50.1.windows.1
+

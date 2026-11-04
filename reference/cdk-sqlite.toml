@@ -1,0 +1,46 @@
+# CDK v0.18.3 SQLite configuration for a migrated Nutshell mint.
+# Set the secret env vars before running `config init`.
+
+[info]
+url = "https://mint.example.com"
+listen_host = "127.0.0.1"
+listen_port = 3338
+
+# Use the same signing material as Nutshell.
+# 0.22.x with MINT_MNEMONIC:
+mnemonic = "env:CDK_MINTD_MNEMONIC"
+# 0.20.x/0.21.x with MINT_PRIVATE_KEY, or any raw-seed mint:
+# seed = "env:CDK_MINTD_SEED"
+
+input_fee_ppk = 100
+
+[info.quote_ttl]
+mint_ttl = 600
+melt_ttl = 120
+
+[database]
+engine = "sqlite"
+
+[[payment_backend]]
+backend = "fakewallet"
+unit = "sat"
+
+# Example: keep an LND unit on the same node (CDK uses gRPC).
+# [[payment_backend]]
+# backend = "lnd"
+# unit = "sat"
+
+[mint_info]
+name = "Example mint"
+description = "Example description"
+# motd = ""
+# icon_url = "https://mint.example.com/icon.png"
+# contact = [["email", "ops@example.com"]]
+# urls = ["https://mint.example.com"]
+# tos_url = "https://mint.example.com/tos"
+
+[fake_wallet]
+fee_percent = 0.02
+reserve_fee_min = 1
+min_delay_time = 0
+max_delay_time = 0

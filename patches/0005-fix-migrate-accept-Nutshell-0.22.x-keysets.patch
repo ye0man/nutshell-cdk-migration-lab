@@ -1,0 +1,74 @@
+From b4d8afcebe406c2bddbcff25b773826b015fcd61 Mon Sep 17 00:00:00 2001
+From: ye0man <jakeyoungman14@gmail.com>
+Date: Wed, 4 Nov 2026 16:39:30 +0900
+Subject: [PATCH 5/5] fix(migrate): accept Nutshell 0.22.x keysets
+
+---
+ crates/cdk-postgres/src/migrate.rs    | 6 +++---
+ crates/cdk-sqlite/src/mint/migrate.rs | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/crates/cdk-postgres/src/migrate.rs b/crates/cdk-postgres/src/migrate.rs
+index e2775bed..76476d94 100644
+--- a/crates/cdk-postgres/src/migrate.rs
++++ b/crates/cdk-postgres/src/migrate.rs
+@@ -50,7 +50,7 @@ async fn connect_client(
+     Ok(client)
+ }
+ 
+-const MAX_SUPPORTED_NUTSHELL_VERSION: &str = "0.22.0";
++const MAX_SUPPORTED_NUTSHELL_VERSION: &str = "0.22.x";
+ const MIN_SUPPORTED_NUTSHELL_SCHEMA_VERSION: i32 = 38;
+ const MAX_SUPPORTED_NUTSHELL_SCHEMA_VERSION: i32 = 42;
+ // Nutshell readers use OFFSET pagination, whose cost grows with every page.
+@@ -1131,7 +1131,7 @@ async fn migrate_from_nutshell_into(
+         )))));
+     }
+ 
+-    let max_v = parse_nutshell_version(MAX_SUPPORTED_NUTSHELL_VERSION).unwrap_or((0, 20, 1));
++    let max_v = (0, 22, u32::MAX);
+     for keyset in &nutshell_keysets {
+         verify_keyset_id(&client, keyset).await?;
+         if let Some(ref version_str) = keyset.issuer_version {
+@@ -1139,7 +1139,7 @@ async fn migrate_from_nutshell_into(
+             if let Some(keyset_v) = parse_nutshell_version(&ver_clean) {
+                 if keyset_v > max_v {
+                     return Err(Error::Database(Box::new(std::io::Error::other(format!(
+-                        "Unsupported Nutshell version: {}. Maximum supported version is: {}.",
++                        "Unsupported Nutshell version: {}. Supported keyset versions are 0.15.0 through {}.",
+                         ver_clean, MAX_SUPPORTED_NUTSHELL_VERSION
+                     )))));
+                 }
+diff --git a/crates/cdk-sqlite/src/mint/migrate.rs b/crates/cdk-sqlite/src/mint/migrate.rs
+index 6d237a51..55b7e916 100644
+--- a/crates/cdk-sqlite/src/mint/migrate.rs
++++ b/crates/cdk-sqlite/src/mint/migrate.rs
+@@ -21,7 +21,7 @@ use rusqlite::OptionalExtension;
+ 
+ use super::MintSqliteDatabase;
+ 
+-const MAX_SUPPORTED_NUTSHELL_VERSION: &str = "0.22.0";
++const MAX_SUPPORTED_NUTSHELL_VERSION: &str = "0.22.x";
+ const MIN_SUPPORTED_NUTSHELL_SCHEMA_VERSION: i64 = 38;
+ const MAX_SUPPORTED_NUTSHELL_SCHEMA_VERSION: i64 = 42;
+ const CHUNK_SIZE: i64 = 2000;
+@@ -1109,14 +1109,14 @@ async fn migrate_from_nutshell_into(
+         )))));
+     }
+ 
+-    let max_v = parse_nutshell_version(MAX_SUPPORTED_NUTSHELL_VERSION).unwrap_or((0, 20, 1));
++    let max_v = (0, 22, u32::MAX);
+     for keyset in &nutshell_keysets {
+         if let Some(ref version_str) = keyset.issuer_version {
+             let ver_clean = version_str.to_string().replace("nutshell/", "");
+             if let Some(keyset_v) = parse_nutshell_version(&ver_clean) {
+                 if keyset_v > max_v {
+                     return Err(Error::Database(Box::new(std::io::Error::other(format!(
+-                        "Unsupported Nutshell version: {}. Maximum supported version is: {}.",
++                        "Unsupported Nutshell version: {}. Supported keyset versions are 0.15.0 through {}.",
+                         ver_clean, MAX_SUPPORTED_NUTSHELL_VERSION
+                     )))));
+                 }
+-- 
+2.50.1.windows.1
+

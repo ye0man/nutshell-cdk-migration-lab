@@ -1,0 +1,43 @@
+# CDK v0.18.3 PostgreSQL configuration for a migrated Nutshell mint.
+# Export the bootstrap variables before `config init`:
+#   CDK_MINTD_DATABASE=postgres
+#   CDK_MINTD_POSTGRES_URL=postgres://cdk:password@127.0.0.1:5432/cdk_mint
+#   CDK_MINTD_POSTGRES_TLS_MODE=disable
+
+[info]
+url = "https://mint.example.com"
+listen_host = "127.0.0.1"
+listen_port = 3338
+
+# Use the same signing material as Nutshell.
+mnemonic = "env:CDK_MINTD_MNEMONIC"
+# seed = "env:CDK_MINTD_SEED"
+
+input_fee_ppk = 100
+
+[info.quote_ttl]
+mint_ttl = 600
+melt_ttl = 120
+
+[database]
+engine = "postgres"
+
+[database.postgres]
+url = "env:CDK_MINTD_POSTGRES_URL"
+tls_mode = "disable"
+# max_connections = 10
+# connection_timeout_seconds = 10
+
+[[payment_backend]]
+backend = "fakewallet"
+unit = "sat"
+
+[mint_info]
+name = "Example mint"
+description = "Example description"
+
+[fake_wallet]
+fee_percent = 0.02
+reserve_fee_min = 1
+min_delay_time = 0
+max_delay_time = 0

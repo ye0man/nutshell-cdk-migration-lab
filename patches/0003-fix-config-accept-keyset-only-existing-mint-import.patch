@@ -1,0 +1,25 @@
+From 6f8d2f7ffbc4e63f67a18a2df391f4fc1892a61e Mon Sep 17 00:00:00 2001
+From: ye0man <jakeyoungman14@gmail.com>
+Date: Wed, 4 Nov 2026 15:59:25 +0900
+Subject: [PATCH 3/5] fix(config): accept keyset-only existing mint import
+
+---
+ crates/cdk-mintd/src/config_service.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/cdk-mintd/src/config_service.rs b/crates/cdk-mintd/src/config_service.rs
+index 1b8f2967..49fd5a16 100644
+--- a/crates/cdk-mintd/src/config_service.rs
++++ b/crates/cdk-mintd/src/config_service.rs
+@@ -486,7 +486,7 @@ fn require_initialization_state(
+         MintInitializationMode::New if database_pubkey.is_some() || has_keysets => {
+             Err(ConfigurationServiceError::NewMintHasExistingState)
+         }
+-        MintInitializationMode::Existing if database_pubkey.is_none() => {
++        MintInitializationMode::Existing if database_pubkey.is_none() && !has_keysets => {
+             Err(ConfigurationServiceError::ExistingMintMissingIdentity)
+         }
+         MintInitializationMode::Existing if !uses_remote_signatory && !has_keysets => {
+-- 
+2.50.1.windows.1
+

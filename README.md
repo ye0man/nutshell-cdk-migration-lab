@@ -1,0 +1,74 @@
+# Nutshell -> CDK migration lab
+
+Lab artifacts for migrating Nutshell mints (0.20.3-0.22.x) to CDK v0.18.3 using
+the ported code from closed CDK PR #2016.
+
+Start with:
+
+- [`GUIDE.md`](GUIDE.md) - operator runbook, verification, hurdle catalog
+- [`GAPS.md`](GAPS.md) - what is and is not verified
+- [`FIELD-REPORTS.md`](FIELD-REPORTS.md) - real reports and a template
+- [`PATCHES.md`](PATCHES.md) - changes to CDK v0.18.3
+- `patches/` - five `git format-patch` files applying to CDK v0.18.3
+- `patched-cdk/` - the built worktree (branch `nutshell-migration-v0.18.3`)
+- `skill/SKILL.md` - opencode skill; copy it to
+  `~/.config/opencode/skills/nutshell-to-cdk-migration/`
+
+## Lab results
+
+| Run | Nutshell | Schema | Database | Result |
+|---|---|---|---|---|
+| S1 | 0.22.0 tag (self-reports 0.21.0) | 42 | SQLite | Pass |
+| S2 | 0.22.0 tag | 42 | PostgreSQL | Pass |
+| S3 | 0.22.0 tag | 42 | SQLite, sat/usd/eur | Pass |
+| S9 | 0.22.1 | 42 | SQLite | Pass |
+| S7 | 0.20.3 | 38 | SQLite, raw seed | Pass |
+| S8 | 0.21.0 | 39 | SQLite, raw seed | Pass |
+
+Edge injections: orphan promise, duplicate melt payment ID, proof in both state
+tables, empty `C` on spent proofs, pending/unpaid quotes.
+
+## Layout
+
+```
+scripts/
+  preflight.py            sanitized preflight report (SQLite/PostgreSQL)
+  simulate.py             mint/swap/melt activity profiles
+  snapshot.py             API + SQLite snapshot
+  snapshot_pg.py          API + pg_dump snapshot
+  compare_keys.py         byte-identical keyset comparison
+  verify_states.py        SQLite source/target state comparison
+  verify_states_pg.py     PostgreSQL source/target state comparison
+  verify_wallet.py        NUT-09 restore, redemption, double-spend check
+  inject_edges.py         inject orphans, duplicate melts, proof-in-both
+  mintctl.ps1             start/stop lab mints on Windows
+  db_inspect.py           Nutshell DB summary
+  cdk_inspect.py          CDK DB summary (v0.18.3)
+  sqlite_query.py         ad-hoc read-only query
+
+reference/
+  nutshell.env.example
+  cdk-sqlite.toml
+  cdk-postgres.toml
+  backend-mapping.md
+
+runs/
+  S1 S2 S3 S5-* S7 S8       scenario data, snapshots, logs
+```
+
+## Build
+
+```powershell
+$env:PROTOC = "C:\path\to\protoc.exe"
+cargo build -p cdk-mintd --no-default-features `
+  --features sqlite,postgres,fakewallet,info-page
+```
+
+Binary: `patched-cdk/target/debug/cdk-mintd.exe`.
+
+## Caveats
+
+- The migration subcommand is not in the stock CDK v0.18.3 release.
+- LND, CLN, Strike, Spark, NUT-21 auth, and large-volume timing were not tested.
+- Nutshell 0.22.0 was published without a version bump; 0.22.1 fixes it and is the release to use.
+- Do not migrate a live database. Freeze, back up, verify, then reopen.
