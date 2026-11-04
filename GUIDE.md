@@ -10,6 +10,23 @@ The lab behind this guide ran on Windows with SQLite, PostgreSQL, and the
 FakeWallet backend. LND, CLN, Strike, and Spark were **not** exercised at
 runtime. The backend mapping section says what is known and what is not.
 
+### Standalone use
+
+The migration command is self-contained. It needs only:
+
+1. the patched `cdk-mintd` binary,
+2. a stopped Nutshell database,
+3. an empty target database of the same engine.
+
+It does **not** need Python, the lab scripts, a seed, a Lightning backend, or a
+`config.toml`. It is a database copy plus verification. The lab scripts are
+optional preflight and verification aids.
+
+Starting CDK after the migration is the part that needs a seed, configuration,
+and one backend per unit. The minimal operator package is in [`handoff/`](handoff/).
+Prebuilt binaries are produced by
+[`.github/workflows/release-binaries.yml`](.github/workflows/release-binaries.yml).
+
 ---
 
 ## 1. What is tested

@@ -6,6 +6,9 @@ the ported code from closed CDK PR #2016.
 Start with:
 
 - [`GUIDE.md`](GUIDE.md) - operator runbook, verification, hurdle catalog
+- [`handoff/`](handoff/) - minimal operator package (binary + SQL preflight)
+- [`.github/workflows/release-binaries.yml`](.github/workflows/release-binaries.yml)
+  - builds `cdk-mintd` for Linux, macOS, and Windows from the patch series
 - [`GAPS.md`](GAPS.md) - what is and is not verified
 - [`FIELD-REPORTS.md`](FIELD-REPORTS.md) - real reports and a template
 - [`PATCHES.md`](PATCHES.md) - changes to CDK v0.18.3

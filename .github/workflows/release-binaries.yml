@@ -1,0 +1,82 @@
+name: Build migration binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: cdk-mintd-linux-x86_64
+          - os: macos-latest
+            artifact: cdk-mintd-macos-aarch64
+          - os: windows-latest
+            artifact: cdk-mintd-windows-x86_64
+    steps:
+      - name: Disable CRLF conversion
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout lab
+        uses: actions/checkout@v4
+        with:
+          path: lab
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout CDK v0.18.3
+        uses: actions/checkout@v4
+        with:
+          repository: cashubtc/cdk
+          ref: v0.18.3
+          path: cdk
+
+      - name: Apply migration patches
+        shell: bash
+        run: |
+          for patch in lab/patches/*.patch; do
+            echo "Applying $patch"
+            git -C cdk apply "$patch"
+          done
+
+      - name: Build cdk-mintd
+        shell: bash
+        run: |
+          cargo build --manifest-path cdk/Cargo.toml \
+            -p cdk-mintd --release \
+            --no-default-features \
+            --features sqlite,postgres,fakewallet,info-page
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ -f cdk/target/release/cdk-mintd.exe ]; then
+            cp cdk/target/release/cdk-mintd.exe dist/cdk-mintd.exe
+          else
+            cp cdk/target/release/cdk-mintd dist/cdk-mintd
+          fi
+          cp lab/GUIDE.md dist/GUIDE.md
+          cp lab/handoff/README.md dist/HANDOFF.md
+          cp lab/handoff/preflight_sqlite.sql dist/
+          cp lab/handoff/preflight_postgres.sql dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
