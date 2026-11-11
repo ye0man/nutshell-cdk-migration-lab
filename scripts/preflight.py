@@ -61,6 +61,55 @@ def sqlite_report(path: str) -> dict:
         "payment_uncertain": one(
             "select count(*) n from melt_quotes where payment_uncertain = 1"
         ),
+        "empty_amounts": one(
+            "select count(*) n from keysets "
+            "where amounts is null or trim(amounts) in ('', '[]')"
+        ),
+        "keysets_unrepresentable": one(
+            "select id, version, derivation_path from keysets where not ("
+            "((length(id) = 16 and id not glob '*[^0-9a-fA-F]*') or "
+            "(length(id) = 66 and lower(substr(id, 1, 2)) = '01' "
+            "and id not glob '*[^0-9a-fA-F]*')) "
+            "and derivation_path like 'm/%' "
+            "and not (version glob '0.[0-9].*' or version glob '0.1[0-4].*'))"
+        ),
+        "null_mint_states": one(
+            "select count(*) n from mint_quotes where state is null"
+        ),
+        "null_melt_states": one(
+            "select count(*) n from melt_quotes where state is null"
+        ),
+        "placeholder_mint_checking_ids": one(
+            "select count(*) n from mint_quotes where checking_id is null "
+            "or trim(checking_id) = '' or lower(checking_id) in ('none', 'null')"
+        ),
+        "duplicate_mint_checking_ids": one(
+            "select checking_id, count(*) n from mint_quotes "
+            "where checking_id is not null and trim(checking_id) <> '' "
+            "and lower(checking_id) not in ('none', 'null') "
+            "group by checking_id having count(*) > 1"
+        ),
+        "invalid_promise_rows": one(
+            "select count(*) n from promises where c_ is not null and ("
+            "b_ is null or length(b_) <> 66 "
+            "or lower(substr(b_, 1, 2)) not in ('02', '03') "
+            "or b_ glob '*[^0-9a-fA-F]*' "
+            "or length(c_) <> 66 "
+            "or lower(substr(c_, 1, 2)) not in ('02', '03') "
+            "or c_ glob '*[^0-9a-fA-F]*')"
+        ),
+        "invalid_pending_proofs": one(
+            "select count(*) n from proofs_pending where c is null "
+            "or trim(c) = '' or length(c) <> 66 "
+            "or lower(substr(c, 1, 2)) not in ('02', '03') "
+            "or c glob '*[^0-9a-fA-F]*'"
+        ),
+        "invalid_spent_proofs": one(
+            "select count(*) n from proofs_used where c is not null "
+            "and trim(c) <> '' and (length(c) <> 66 "
+            "or lower(substr(c, 1, 2)) not in ('02', '03') "
+            "or c glob '*[^0-9a-fA-F]*')"
+        ),
     }
     if isinstance(out["warnings"]["payment_uncertain"], dict):
         out["warnings"]["payment_uncertain"] = {
@@ -126,6 +175,58 @@ async def pg_report(url: str) -> dict:
         ),
         "payment_uncertain": await fetch(
             "select count(*) n from melt_quotes where payment_uncertain = 1"
+        ),
+        "empty_amounts": await fetch(
+            "select count(*) n from keysets "
+            "where amounts is null or btrim(amounts) in ('', '[]')"
+        ),
+        "keysets_unrepresentable": await fetch(
+            "select id, version, derivation_path from keysets where not ("
+            "(id ~* '^[0-9a-f]{16}$' or id ~* '^01[0-9a-f]{64}$') "
+            "and derivation_path like 'm/%' "
+            "and version !~ '^0\\.([0-9]|1[0-4])(\\.|$)')"
+        ),
+        "null_mint_states": await fetch(
+            "select count(*) n from mint_quotes where state is null"
+        ),
+        "null_melt_states": await fetch(
+            "select count(*) n from melt_quotes where state is null"
+        ),
+        "placeholder_mint_checking_ids": await fetch(
+            "select count(*) n from mint_quotes where checking_id is null "
+            "or btrim(checking_id) = '' "
+            "or lower(checking_id) in ('none', 'null')"
+        ),
+        "duplicate_mint_checking_ids": await fetch(
+            "select checking_id, count(*) n from mint_quotes "
+            "where checking_id is not null and btrim(checking_id) <> '' "
+            "and lower(checking_id) not in ('none', 'null') "
+            "group by checking_id having count(*) > 1"
+        ),
+        "invalid_promise_rows": await fetch(
+            "select count(*) n from promises where c_ is not null and ("
+            "b_ is null or b_ !~* '^0[23][0-9a-f]{64}$' "
+            "or c_ !~* '^0[23][0-9a-f]{64}$')"
+        ),
+        "invalid_pending_proofs": await fetch(
+            "select count(*) n from proofs_pending where c is null "
+            "or btrim(c) = '' or c !~* '^0[23][0-9a-f]{64}$'"
+        ),
+        "invalid_spent_proofs": await fetch(
+            "select count(*) n from proofs_used where c is not null "
+            "and btrim(c) <> '' and c !~* '^0[23][0-9a-f]{64}$'"
+        ),
+        "int4_amount_columns": await fetch(
+            "select table_name, column_name, data_type "
+            "from information_schema.columns where table_schema = 'public' "
+            "and column_name in ('amount', 'fee_reserve', 'amount_paid', 'amount_issued') "
+            "and data_type in ('integer', 'smallint') "
+            "order by table_name, column_name"
+        ),
+        "expiry_out_of_int4_range": await fetch(
+            "select count(*) n from melt_quotes where case "
+            "when expiry::text ~ '^[0-9]+$' "
+            "then expiry::text::bigint > 2147483647 else false end"
         ),
     }
     if isinstance(out["warnings"]["payment_uncertain"], dict):

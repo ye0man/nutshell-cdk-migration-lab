@@ -14,6 +14,10 @@ mnemonic = "env:CDK_MINTD_MNEMONIC"
 
 input_fee_ppk = 100
 
+# Optional: rotate new issuance to a NUT-02 v2 keyset (01-prefix id).
+# Confirm every wallet in the fleet accepts v2 ids before enabling.
+# use_keyset_v2 = true
+
 [info.quote_ttl]
 mint_ttl = 600
 melt_ttl = 120

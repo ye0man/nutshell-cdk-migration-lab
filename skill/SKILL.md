@@ -53,6 +53,12 @@ Check:
 - `duplicate_melt_checking_ids`: resolve manually; no override.
 - `payment_uncertain`: settle pending melts first.
 - `null_c_promises` is normal.
+- `empty_amounts`, `keysets_unrepresentable`, `null_mint_states`,
+  `null_melt_states`, `placeholder_mint_checking_ids`,
+  `duplicate_mint_checking_ids`, `invalid_promise_rows`,
+  `invalid_pending_proofs`, `invalid_spent_proofs`: clean the copy with the
+  matching `scripts/prepare_source_*.sql` before migrating. PostgreSQL also
+  reports `int4_amount_columns` and `expiry_out_of_int4_range`.
 
 If any condition is unexpected, stop and request the sanitized preflight report.
 
@@ -132,12 +138,17 @@ Configuration gotchas:
 ## Step 6 - Verify
 
 ```powershell
+python $LAB\scripts\verify_keyset_ids.py http://127.0.0.1:3338
 python $LAB\scripts\compare_keys.py snapshot\nutshell-keys.json http://127.0.0.1:3338
 python $LAB\scripts\verify_states.py --source <nutshell-db> `
   --target <cdk-db> --allow-new-keysets
 python $LAB\scripts\verify_wallet.py --url http://127.0.0.1:3338 `
   --mnemonic "<wallet mnemonic>" --db restore.sqlite3 --test-spend
 ```
+
+`verify_keyset_ids.py` recomputes the NUT-02 id from the served keys; exit 1
+means do not cut over. It catches a truncated amount list that byte-comparison
+against a snapshot would miss.
 
 For PostgreSQL use `verify_states_pg.py`.
 

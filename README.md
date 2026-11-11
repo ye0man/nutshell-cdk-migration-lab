@@ -12,7 +12,7 @@ Start with:
 - [`GAPS.md`](GAPS.md) - what is and is not verified
 - [`FIELD-REPORTS.md`](FIELD-REPORTS.md) - real reports and a template
 - [`PATCHES.md`](PATCHES.md) - changes to CDK v0.18.3
-- `patches/` - five `git format-patch` files applying to CDK v0.18.3
+- `patches/` - six `git format-patch` files applying to CDK v0.18.3
 - `patched-cdk/` - the built worktree (branch `nutshell-migration-v0.18.3`)
 - `skill/SKILL.md` - opencode skill; copy it to
   `~/.config/opencode/skills/nutshell-to-cdk-migration/`
@@ -36,6 +36,9 @@ tables, empty `C` on spent proofs, pending/unpaid quotes.
 ```
 scripts/
   preflight.py            sanitized preflight report (SQLite/PostgreSQL)
+  prepare_source_postgres.sql  clean a source copy for migration
+  prepare_source_sqlite.sql    clean a source copy for migration
+  verify_keyset_ids.py    re-hash served keys to their NUT-02 id
   simulate.py             mint/swap/melt activity profiles
   snapshot.py             API + SQLite snapshot
   snapshot_pg.py          API + pg_dump snapshot

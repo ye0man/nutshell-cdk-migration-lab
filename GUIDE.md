@@ -46,6 +46,9 @@ Prebuilt binaries are produced by
 | Proof present in both spent and pending tables | Deduplicated and verified |
 | NUT-09 restore | Verified |
 | Redeeming old notes, double-spend rejection | Verified |
+| Keyset-id guard (`verify_keyset_ids.py`) | Verified against a migrated mint |
+| NULL states, literal `None` lookup ids, empty `amounts` | Verified on a mutated SQLite copy |
+| PostgreSQL int4 columns / Y2038 expiry | Normalized in code; not exercised live |
 | LND / CLN / Strike / Spark runtime | **Not tested** |
 | NUT-21 auth database | **Not migrated** |
 
@@ -66,6 +69,12 @@ Copied:
 - promises (blind signatures and pending blinded messages)
 - spent and pending proofs
 - keyset liabilities and payment lookup IDs
+
+The migration keeps each keyset's original amount list. Keysets CDK cannot
+represent (legacy/base58 ids, non-BIP32 derivation paths, pre-0.15 keysets) are
+skipped, and their promises and proofs are skipped with them. Run the
+source-cleaning SQL in section 6.5 to remove them up front. Leaving their
+balances behind can make the per-keyset liability check fail.
 
 Not copied:
 
@@ -136,6 +145,23 @@ Review these fields:
   as blinded messages.
 - `payment_uncertain`: pending melts whose backend state was uncertain. Settle or
   reconcile them before cutover.
+- `empty_amounts`: keysets with an empty amount list. The migrator supplies a
+  default; if that default is wrong the served keys no longer hash to the keyset
+  id. Repair in section 6.5 and run the keyset-id guard in section 10.
+- `keysets_unrepresentable`: keysets that will be skipped (legacy id, non-BIP32
+  path, pre-0.15). Prune their rows on the copy (section 6.5).
+- `null_mint_states` / `null_melt_states`: NULL quote states. The patched port
+  maps these to UNPAID; the SQL also backfills them.
+- `placeholder_mint_checking_ids` / `duplicate_mint_checking_ids`: NULL, empty,
+  or literal `None` lookup ids collide with CDK's unique `request_lookup_id`.
+  Normalize and deduplicate on the copy.
+- `invalid_promise_rows`, `invalid_pending_proofs`, `invalid_spent_proofs`: rows
+  the migrator skips but which still count toward source liabilities, causing
+  the liability check to fail. Remove them on the copy.
+- PostgreSQL only: `int4_amount_columns` lists `amount`/`fee_reserve` columns
+  stored as int4, and `expiry_out_of_int4_range` counts melt quotes beyond the
+  2038 ceiling. The patched port casts the reads and clamps expiry; confirm both
+  are clean anyway.
 
 The raw SQL for the same checks is in `scripts/preflight.py`; run it read-only.
 
@@ -165,6 +191,26 @@ Rules:
   if clients depend on it, set `[mint_info].pubkey` to that value. This does not
   change keyset signatures.
 
+### Verify the signer without printing it
+
+Nutshell derives each keyset with BIP32 over the raw UTF-8 bytes of the seed.
+CDK reproduces that only when the value is supplied verbatim as `[info].seed`.
+A BIP39 mnemonic path (or a seed-file conversion) derives different keys, which
+is why a raw seed must never be converted to a mnemonic or the reverse.
+
+You can confirm the value without disclosing it by comparing hashes:
+
+```bash
+# PostgreSQL: hash the stored seed and the value you intend to configure.
+printf '%s' "$CDK_SEED" | md5sum
+psql "$NUTSHELL_URL" -Atc \
+  "select md5(seed) from keysets where derivation_path like 'm/%' limit 1"
+```
+
+The two hashes must match. For SQLite, read `keysets.seed` if your Nutshell
+version stores it and hash it with the same tool. `config init --existing-mint`
+is still the final authority: it verifies the signer against historical keysets.
+
 ---
 
 ## 6. Choose the target database
@@ -187,6 +233,46 @@ supported.
 - Pass the target URL explicitly. If your config stores `env:CDK_MINTD_POSTGRES_URL`,
   resolve it in the shell before running the migrator; the original PR did not.
 - The tool applies the CDK schema and refuses a non-empty target.
+
+---
+
+## 6.5 Clean the source copy (recommended)
+
+Run this against the **copy**, never the live database. The migrator was
+validated on clean test mints; a production database carries history it will
+skip or reject. The cleaning scripts make the migrator's row counts and
+per-keyset liabilities line up with what it can actually represent.
+
+```bash
+# PostgreSQL
+psql 'postgres://nutshell:password@127.0.0.1:5432/nutshell_copy' \
+  -v ON_ERROR_STOP=1 -f scripts/prepare_source_postgres.sql
+
+# SQLite
+sqlite3 nutshell-copy.sqlite3 < scripts/prepare_source_sqlite.sql
+```
+
+Both scripts are idempotent and run in a transaction. Review the preview
+`SELECT`s at the top before you commit if you want to inspect the changes. They:
+
+1. Repair keysets whose `amounts` list is empty (Nutshell keysets span 2^0 .. 2^63).
+2. Normalize NULL, empty, and literal `None` payment lookup ids.
+3. Deduplicate paid/pending melt quotes per `checking_id` (keep PAID, then the
+   earliest; rename the rest with `-dup-<quote>`).
+4. Backfill NULL quote states to UNPAID.
+5. Clamp melt-quote expiry beyond the int4 (2038) ceiling (PostgreSQL).
+6. Prune keysets CDK cannot represent, and their promises, proofs, and pubkeys.
+7. Remove promise and proof rows the migrator cannot parse but which still count
+   toward source liabilities.
+8. Run `ANALYZE`.
+
+One case cannot be detected in SQL: a `b_` or `c_` value that is valid compressed
+hex but not a valid curve point. The migrator logs it as `invalid B_` and skips
+it, which leaves its amount in the source liability. If you see such a log line,
+delete that row by its `b_` value on the copy and re-run.
+
+Rows whose keyset is missing entirely are still orphans. Use `--allow-orphans`
+for those only, after recording the counts.
 
 ---
 
@@ -226,6 +312,25 @@ Always run `--verify-only` after a successful migration and before starting CDK.
 
 The migration itself does not touch the Nutshell database. It opens SQLite in
 read-only mode for verification.
+
+### What the patched port normalizes on read
+
+The port tolerates common historical data without needing the section 6.5 SQL:
+
+- NULL mint/melt quote states become UNPAID.
+- NULL, empty, or literal `None` `checking_id` values fall back to the quote id,
+  so they do not collide on CDK's unique `request_lookup_id`.
+- PostgreSQL reads `amount`, `fee_reserve`, `amount_paid`, `amount_issued`, and
+  `order_index` through `::bigint`, so int4 source columns do not fail.
+- An empty keyset `amounts` list falls back to the full 64-denomination set on
+  both SQLite and PostgreSQL.
+- Melt-quote expiry is clamped to the int4 ceiling (2038).
+- Duplicate paid/pending melt quotes with a real payment id still abort. That is
+  intentional: run the dedup step in section 6.5.
+
+`--verify-only` checks row counts, quote accounting, promise ordering, and
+per-keyset liabilities. It does **not** re-hash the public keys the mint will
+serve. Run the keyset-id guard in section 10 with the mint serving.
 
 ---
 
@@ -296,6 +401,21 @@ See `reference/cdk-sqlite.toml` and `reference/cdk-postgres.toml`.
 5. **Old notes remain spendable** because the old keysets and promises are
    preserved.
 
+### Keyset issuance policy
+
+The migrated keysets stay present, inactive, and spendable. New issuance uses a
+new CDK keyset. In v0.18.3 that is a 32-amount V1 keyset by default.
+
+If your wallet fleet accepts NUT-02 v2 ids (`01`-prefix), set this in `[info]`
+to rotate to a V2 keyset deterministically:
+
+```toml
+use_keyset_v2 = true
+```
+
+Confirm wallet support before cutover. If any wallet in the fleet rejects v2
+ids, leave the setting unset.
+
 ---
 
 ## 10. Verification checklist
@@ -304,7 +424,21 @@ Run these before reopening the mint.
 
 ### Keys and keysets
 
-- Fetch `/v1/keys/{id}` for every old keyset; compare all 64 public keys with the
+- Run the keyset-id guard while the mint is serving. It fetches every advertised
+  keyset, recomputes the NUT-02 id from the served public keys, and fails if the
+  set does not match. This is independent of the source snapshot and catches a
+  truncated amount list that byte-comparison would miss.
+
+  ```bash
+  python scripts/verify_keyset_ids.py http://127.0.0.1:3338
+  # Optional: also require byte-identity with the source mint
+  python scripts/verify_keyset_ids.py http://127.0.0.1:3338 https://mint.example.com
+  ```
+
+  Exit code 1 means do not open the mint. The guard accepts the legacy Nutshell
+  v2 calculation that hashed an explicit zero expiry.
+
+- Fetch `/v1/keys/{id}` for every old keyset; compare all public keys with the
   pre-migration snapshot. In the lab all old keysets were byte-identical.
 - `/v1/keysets` must list every old keyset as inactive, plus the new active keyset
   per unit.
@@ -375,6 +509,14 @@ to Nutshell. Keep the maintenance window closed until verification passes.
 | New `/v1/info` pubkey | CDK derives its own info pubkey | Set `[mint_info].pubkey` to the old value if needed |
 | Old keyset inactive after start | Expected rotation 64 -> 32 | Old keyset remains valid for spending |
 | Auth users missing | Auth database is separate and not migrated | Plan a separate auth migration |
+| `cannot convert Option<i64> and int4` (PostgreSQL) | `amount`/`fee_reserve` stored as int4 | Use this port (casts reads), or widen the columns on the copy |
+| Wallet rejects a keyset / served keys do not match id | Empty or short `amounts` list | Repair in section 6.5; run `verify_keyset_ids.py` |
+| `duplicate key value violates unique constraint` on `request_lookup_id` | NULL/empty/`None` or duplicate `checking_id` | Normalize and deduplicate in section 6.5 |
+| `Error converting Number, expecting type expiry` | Melt expiry beyond int4 (Y2038) | Port clamps expiry; also clamp in section 6.5 |
+| `multiple paid or pending melt quotes for checking_id` | Duplicate real payment ids | Deduplicate in section 6.5 |
+| Migration aborts reading a NULL quote state | Older row has NULL state | Port maps NULL to UNPAID; backfill in section 6.5 |
+| `per-keyset liabilities differ` | Skipped unparseable rows or pruned keysets | Clean rows and keysets in section 6.5 |
+| Legacy/base58 keyset silently skipped | Id is not NUT-02 hex | Prune its rows in section 6.5; keep the base58 mint separate |
 
 ---
 
@@ -394,8 +536,9 @@ Do not change node identity with pending melts. Settle them first.
 
 ## 14. Reporting gaps
 
-If your setup is not covered, attach `preflight.md` and the migration output to a
-field report. Do not attach seeds, mnemonics, macaroons, proof secrets, or raw
+If your setup is not covered, attach `preflight.md`, the `prepare_source_*`
+preview counts, the migration output, and the `verify_keyset_ids.py` result to
+a field report. Do not attach seeds, mnemonics, macaroons, proof secrets, or raw
 database dumps. The preflight report is designed to be safe to share.
 
 See `GAPS.md` and `FIELD-REPORTS.md`.

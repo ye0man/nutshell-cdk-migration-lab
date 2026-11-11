@@ -48,6 +48,32 @@ and extended to Nutshell 0.20.3-0.22.x.
    - Validated against Nutshell 0.22.0 (tag, schema 42), 0.22.1 (schema 42),
      0.21.0 (schema 39), and 0.20.3 (schema 38).
 
+7. **Historical-data normalization** (SQLite and PostgreSQL)
+   - NULL mint/melt quote states map to UNPAID instead of failing the read.
+   - NULL, empty, or literal `None` `checking_id` values fall back to the quote
+     id, avoiding collisions on CDK's unique `request_lookup_id`.
+   - The duplicate-melt guard ignores those placeholders but still aborts on a
+     real repeated payment id.
+
+8. **PostgreSQL type tolerance**
+   - `amount`, `fee_reserve`, `amount_paid`, `amount_issued`, `order_index`,
+     `input_fee_ppk`, and `final_expiry` are read through `::bigint`, so int4
+     source columns do not fail tokio-postgres deserialization.
+   - Melt-quote expiry is clamped to the int4 (2038) ceiling before insert.
+
+9. **Complete keyset amount fallback**
+   - An empty or invalid `amounts` list now falls back to 64 denominations
+     (2^0 .. 2^63) on PostgreSQL as well as SQLite. The previous PostgreSQL
+     fallback of 32 could serve keys that no longer hash to the keyset id.
+
+10. **Operator tooling**
+    - `scripts/verify_keyset_ids.py` re-hashes served keys to their NUT-02 id.
+    - `scripts/prepare_source_postgres.sql` and `prepare_source_sqlite.sql`
+      clean a source copy for the cases above.
+
+Patch files: `patches/0001` through `patches/0005` are the base port; the
+historical-data fixes above are in `patches/0006-fix-migrate-historical-data.patch`.
+
 ## Build on Windows
 
 The migration build does not need LND/CLN/BDK features. `cdk-signatory` still

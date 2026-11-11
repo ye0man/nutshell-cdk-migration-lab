@@ -46,6 +46,28 @@ cdk-mintd migrate-nutshell \
 cdk-mintd migrate-nutshell --source ... --target ... --verify-only
 ```
 
+## Clean the source copy
+
+Historical mints can carry keysets and rows the migrator skips, which makes the
+per-keyset liability check fail. Run the matching script against a **copy** of
+the source database before migrating:
+
+- `../scripts/prepare_source_postgres.sql`
+- `../scripts/prepare_source_sqlite.sql`
+
+Both are idempotent and run in a transaction. See section 6.5 of the full guide.
+
+## Verify served keys
+
+The migrator does not re-hash the keys the mint will serve. With the migrated
+mint running:
+
+```bash
+python ../scripts/verify_keyset_ids.py http://127.0.0.1:3338
+```
+
+Exit code 1 means do not cut over.
+
 Then initialize CDK configuration with the original seed:
 
 ```bash
