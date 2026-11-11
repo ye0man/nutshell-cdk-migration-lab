@@ -21,6 +21,8 @@ ran it against the target versions.
 | Keyset rotation on first CDK start | Every run: old keysets inactive, new active, old keys identical |
 | Short raw seed import | S7/S8 with `MINT_PRIVATE_KEY`, v0.18.3 warning |
 | Config/DB collision avoidance | Explicit `--target` design |
+| Keyset-id guard | S1 migrated mint: the 64-key Nutshell keyset (`018746...`) and the 32-key CDK keyset both re-hash to their advertised ids |
+| Historical normalization | Mutated S1 SQLite copy with NULL states, literal `None` lookup ids, and an empty `amounts` list: migration and `--verify-only` passed; target has 64 amounts and no placeholders |
 
 ## Not verified
 
@@ -34,7 +36,8 @@ ran it against the target versions.
 | Failed melt quote state | Not exercised | Source state, target state, whether funds were released |
 | Expired quote semantics | TTL was set to 1 second but expiry fields were not independently audited | Source and target expiry values |
 | Multiple historical keysets from a Nutshell-internal rotation | Not exercised; CDK-side rotation is verified | Keyset count, IDs, derivation paths, per-keyset proof counts |
-| Large production volume (50k+ proofs) | The lab used 300-900 proofs per run | Row counts, migration duration, memory |
+| Large production volume (50k+ proofs) | The lab used 300-900 proofs per run; PostgreSQL uses 100k-row chunks and vacuums the aggregate | Row counts, migration duration, memory |
+| PostgreSQL on Nutshell 0.20.3 / 0.21.0 (schema 38/39) | PostgreSQL was verified on schema 42 only; older schemas can store amounts as int4 | Schema, column types, migration result |
 | Custom Nutshell forks | No fork available | Schema diff, extra columns, custom derivation |
 | SQLCipher/encrypted SQLite | Not exercised | Whether `--password` opens the target |
 | Redis cache | Not migrated; safe to discard | Only if you observe cache-related issues |
@@ -47,6 +50,10 @@ ran it against the target versions.
 - Pre-0.15 Nutshell keysets are rejected; their derivation is not supported.
 - The migration does not rewrite spent proofs' missing `C`; it stores a
   placeholder for spent rows only.
+- Duplicate paid/pending melt quotes with a real payment id are not resolved
+  automatically. Run the dedup step in `scripts/prepare_source_*.sql`.
+- The migration keeps the original keysets for redemption. New issuance uses a
+  CDK keyset (32-amount V1 by default, or V2 with `use_keyset_v2 = true`).
 - The migration does not create a CDK mint-info record. The patched
   `config init --existing-mint` accepts a keyset-only database; stock v0.18.3
   does not.

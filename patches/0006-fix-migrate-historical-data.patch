@@ -1,0 +1,423 @@
+From ff546f14b6558d57deb4b8e94154224bdafdf087 Mon Sep 17 00:00:00 2001
+From: ye0man <jakeyoungman14@gmail.com>
+Date: Wed, 11 Nov 2026 13:19:04 +0900
+Subject: [PATCH] fix(migrate): tolerate historical Nutshell data
+
+---
+ crates/cdk-postgres/src/lib.rs        |  1 +
+ crates/cdk-postgres/src/migrate.rs    | 85 +++++++++++++++++++--------
+ crates/cdk-sqlite/src/mint/migrate.rs | 47 ++++++++++++---
+ crates/cdk-sqlite/src/mint/mod.rs     |  1 +
+ docs/nutshell-migration.md            | 20 +++++++
+ 5 files changed, 122 insertions(+), 32 deletions(-)
+
+diff --git a/crates/cdk-postgres/src/lib.rs b/crates/cdk-postgres/src/lib.rs
+index d45c9aa1..eba77324 100644
+--- a/crates/cdk-postgres/src/lib.rs
++++ b/crates/cdk-postgres/src/lib.rs
+@@ -17,6 +17,7 @@ use tokio::time::timeout;
+ use tokio_postgres::{Client, Error as PgError, NoTls};
+ 
+ mod db;
++/// Nutshell to CDK migration support.
+ pub mod migrate;
+ mod tls;
+ mod value;
+diff --git a/crates/cdk-postgres/src/migrate.rs b/crates/cdk-postgres/src/migrate.rs
+index 76476d94..8526135b 100644
+--- a/crates/cdk-postgres/src/migrate.rs
++++ b/crates/cdk-postgres/src/migrate.rs
+@@ -133,8 +133,8 @@ async fn validate_nutshell_schema(
+         .await
+         .map_err(|e| Error::Database(Box::new(e)))?
+         .get::<_, i32>(0);
+-    if version < MIN_SUPPORTED_NUTSHELL_SCHEMA_VERSION
+-        || version > MAX_SUPPORTED_NUTSHELL_SCHEMA_VERSION
++    if !(MIN_SUPPORTED_NUTSHELL_SCHEMA_VERSION..=MAX_SUPPORTED_NUTSHELL_SCHEMA_VERSION)
++        .contains(&version)
+     {
+         if options.allow_unknown_schema {
+             tracing::warn!(
+@@ -179,7 +179,7 @@ async fn count_orphan_keyset_rows(client: &tokio_postgres::Client) -> Result<(i6
+ async fn validate_melt_quote_lookup_ids(client: &tokio_postgres::Client) -> Result<(), Error> {
+     let duplicate = client
+         .query_opt(
+-            "SELECT checking_id FROM melt_quotes WHERE lower(state) IN ('paid', 'pending') GROUP BY checking_id HAVING COUNT(*) > 1 LIMIT 1",
++            "SELECT checking_id FROM melt_quotes WHERE lower(state) IN ('paid', 'pending') AND checking_id IS NOT NULL AND btrim(checking_id) <> '' AND lower(checking_id) NOT IN ('none', 'null') GROUP BY checking_id HAVING COUNT(*) > 1 LIMIT 1",
+             &[],
+         )
+         .await
+@@ -340,6 +340,23 @@ fn parse_nutshell_timestamp(v: &str) -> u64 {
+     0
+ }
+ 
++fn normalize_lookup_id(raw: Option<&str>, quote: &str) -> String {
++    match raw {
++        Some(value)
++            if !value.is_empty()
++                && !value.eq_ignore_ascii_case("none")
++                && !value.eq_ignore_ascii_case("null") =>
++        {
++            value.to_string()
++        }
++        _ => quote.to_string(),
++    }
++}
++
++fn clamp_int4_timestamp(ts: u64) -> u64 {
++    ts.min(i32::MAX as u64)
++}
++
+ async fn read_keysets_postgres(
+     client: &tokio_postgres::Client,
+ ) -> Result<Vec<MintKeySetInfo>, Error> {
+@@ -357,9 +374,9 @@ async fn read_keysets_postgres(
+         .unwrap_or(false);
+ 
+     let query = if has_final_expiry {
+-        "SELECT id, derivation_path, valid_from::text, valid_to::text, active, version, unit, input_fee_ppk, amounts, final_expiry FROM keysets;"
++        "SELECT id, derivation_path, valid_from::text, valid_to::text, active, version, unit, input_fee_ppk::bigint, amounts, final_expiry::bigint FROM keysets;"
+     } else {
+-        "SELECT id, derivation_path, valid_from::text, valid_to::text, active, version, unit, input_fee_ppk, amounts, NULL::integer FROM keysets;"
++        "SELECT id, derivation_path, valid_from::text, valid_to::text, active, version, unit, input_fee_ppk::bigint, amounts, NULL::bigint FROM keysets;"
+     };
+ 
+     let rows = client
+@@ -375,17 +392,20 @@ async fn read_keysets_postgres(
+         let active: bool = r.get(4);
+         let version: String = r.get(5);
+         let unit_str: String = r.get(6);
+-        let input_fee_ppk: i32 = r.get::<_, Option<i32>>(7).unwrap_or(0);
++        let input_fee_ppk: i64 = r.get::<_, Option<i64>>(7).unwrap_or(0);
+         let amounts_str: String = r
+             .get::<_, Option<String>>(8)
+             .unwrap_or_else(|| "[]".to_string());
+-        let final_expiry_val: Option<i32> = r.get(9);
++        let final_expiry_val: Option<i64> = r.get(9);
+ 
++        // Nutshell keysets span 64 denominations (2^0..2^63). Falling back to
++        // 32 silently truncates an empty/invalid amounts list and serves keys
++        // that no longer hash to the keyset id.
+         let amounts_vec: Vec<u64> = if amounts_str.is_empty() || amounts_str == "[]" {
+-            (0..32).map(|i| 2_u64.pow(i)).collect()
++            (0..64).map(|i| 2_u64.pow(i)).collect()
+         } else {
+             serde_json::from_str(&amounts_str)
+-                .unwrap_or_else(|_| (0..32).map(|i| 2_u64.pow(i)).collect())
++                .unwrap_or_else(|_| (0..64).map(|i| 2_u64.pow(i)).collect())
+         };
+ 
+         let valid_from = parse_nutshell_timestamp(&valid_from_str);
+@@ -531,7 +551,9 @@ async fn verify_keyset_id(
+         input_fee_ppk: keyset.input_fee_ppk,
+         final_expiry: keyset.final_expiry,
+     }
+-    .verify_id()
++    // Nutshell v2 keysets without a final expiry may have hashed an explicit
++    // zero expiry; accept that legacy calculation as well.
++    .verify_id_for_legacy_nutshell_migration()
+     .map_err(|e| {
+         Error::Database(Box::new(std::io::Error::other(format!(
+             "Keyset {} public keys do not match its stored id: {e}",
+@@ -554,7 +576,7 @@ async fn read_mint_quotes_chunk_postgres(
+     )>,
+     Error,
+ > {
+-    let rows = client.query("SELECT quote, method, request, checking_id, unit, amount, created_time::text, paid_time::text, state, pubkey, amount_paid, amount_issued, updated_at::text FROM mint_quotes ORDER BY quote LIMIT $1 OFFSET $2;", &[&limit, &offset])
++    let rows = client.query("SELECT quote, method, request, checking_id, unit, amount::bigint, created_time::text, paid_time::text, state, pubkey, amount_paid::bigint, amount_issued::bigint, updated_at::text FROM mint_quotes ORDER BY quote LIMIT $1 OFFSET $2;", &[&limit, &offset])
+         .await
+         .map_err(|e| Error::Database(Box::new(e)))?;
+     let mut chunk = Vec::new();
+@@ -562,12 +584,12 @@ async fn read_mint_quotes_chunk_postgres(
+         let quote: String = r.get(0);
+         let method_str: String = r.get(1);
+         let request: String = r.get(2);
+-        let checking_id: String = r.get(3);
++        let checking_id: Option<String> = r.get(3);
+         let unit_str: String = r.get(4);
+         let amount: i64 = r.get(5);
+         let created_time_str: Option<String> = r.get(6);
+         let paid_time_str: Option<String> = r.get(7);
+-        let state_str: String = r.get(8);
++        let state_str: Option<String> = r.get(8);
+         let pubkey_str: Option<String> = r.get(9);
+         let stored_amount_paid: Option<i64> = r.get(10);
+         let stored_amount_issued: Option<i64> = r.get(11);
+@@ -602,7 +624,12 @@ async fn read_mint_quotes_chunk_postgres(
+             .as_ref()
+             .map(|t| parse_nutshell_timestamp(t))
+             .unwrap_or_else(cdk_common::util::unix_time);
+-        let expiry = created_time + 86400; // default 24h
++        let expiry = clamp_int4_timestamp(created_time + 86400); // default 24h
++
++        // Older Nutshell rows use the literal "None" (or NULL) as the payment
++        // lookup id. CDK requires a unique request_lookup_id, so fall back to
++        // the quote id instead of colliding on the placeholder.
++        let checking_id = normalize_lookup_id(checking_id.as_deref(), &quote);
+ 
+         let request_lookup_id_kind = if checking_id.len() == 64 && hex::decode(&checking_id).is_ok()
+         {
+@@ -623,7 +650,12 @@ async fn read_mint_quotes_chunk_postgres(
+             }
+         };
+ 
+-        let state_mapped = match state_str.to_lowercase().as_str() {
++        let state_mapped = match state_str
++            .as_deref()
++            .unwrap_or_default()
++            .to_lowercase()
++            .as_str()
++        {
+             "paid" => MintQuoteState::Paid,
+             "issued" => MintQuoteState::Issued,
+             _ => MintQuoteState::Unpaid,
+@@ -696,7 +728,7 @@ async fn read_melt_quotes_chunk_postgres(
+     } else {
+         "NULL::boolean"
+     };
+-    let query = format!("SELECT quote, method, request, checking_id, unit, amount, fee_reserve, {paid_column}, created_time::text, paid_time::text, state, expiry::text, proof FROM melt_quotes ORDER BY quote LIMIT $1 OFFSET $2;");
++    let query = format!("SELECT quote, method, request, checking_id, unit, amount::bigint, fee_reserve::bigint, {paid_column}, created_time::text, paid_time::text, state, expiry::text, proof FROM melt_quotes ORDER BY quote LIMIT $1 OFFSET $2;");
+     let rows = client
+         .query(&query, &[&limit, &offset])
+         .await
+@@ -706,7 +738,7 @@ async fn read_melt_quotes_chunk_postgres(
+         let quote: String = r.get(0);
+         let method_str: String = r.get(1);
+         let request_str: String = r.get(2);
+-        let checking_id: String = r.get(3);
++        let checking_id: Option<String> = r.get(3);
+         let unit_str: String = r.get(4);
+         let amount: i64 = r.get(5);
+         let fee_reserve = r
+@@ -715,7 +747,7 @@ async fn read_melt_quotes_chunk_postgres(
+             .unwrap_or(0);
+         let created_time_str: Option<String> = r.get(8);
+         let paid_time_str: Option<String> = r.get(9);
+-        let state_str: String = r.get(10);
++        let state_str: Option<String> = r.get(10);
+         let expiry_str: Option<String> = r.get(11);
+         let payment_proof: Option<String> = r.get(12);
+ 
+@@ -750,7 +782,9 @@ async fn read_melt_quotes_chunk_postgres(
+             .as_ref()
+             .map(|t| parse_nutshell_timestamp(t))
+             .unwrap_or(created_time + 86400);
++        let expiry = clamp_int4_timestamp(expiry);
+         let paid_time = paid_time_str.as_ref().map(|t| parse_nutshell_timestamp(t));
++        let checking_id = normalize_lookup_id(checking_id.as_deref(), &quote);
+ 
+         let request = if let Ok(bolt11) = lightning_invoice::Bolt11Invoice::from_str(&request_str) {
+             MeltPaymentRequest::Bolt11 { bolt11 }
+@@ -775,7 +809,12 @@ async fn read_melt_quotes_chunk_postgres(
+             Some(PaymentIdentifier::CustomId(checking_id))
+         };
+ 
+-        let state_mapped = match state_str.to_lowercase().as_str() {
++        let state_mapped = match state_str
++            .as_deref()
++            .unwrap_or_default()
++            .to_lowercase()
++            .as_str()
++        {
+             "paid" => MeltQuoteState::Paid,
+             "pending" => MeltQuoteState::Pending,
+             // CDK's persisted melt quote schema has no FAILED state. A failed
+@@ -835,7 +874,7 @@ async fn read_promises_chunk_postgres(
+     } else {
+         "NULL::text, NULL::text"
+     };
+-    let query = format!("SELECT amount, id, b_, c_, {dleq_columns}, mint_quote, melt_quote, order_index FROM promises ORDER BY b_ LIMIT $1 OFFSET $2;");
++    let query = format!("SELECT amount::bigint, id, b_, c_, {dleq_columns}, mint_quote, melt_quote, order_index::bigint FROM promises ORDER BY b_ LIMIT $1 OFFSET $2;");
+     let rows = client
+         .query(&query, &[&limit, &offset])
+         .await
+@@ -850,7 +889,7 @@ async fn read_promises_chunk_postgres(
+         let dleq_s_str: Option<String> = r.get(5);
+         let mint_quote_str: Option<String> = r.get(6);
+         let melt_quote_str: Option<String> = r.get(7);
+-        let order_index = r.get::<_, Option<i32>>(8).unwrap_or(0) as u64;
++        let order_index = r.get::<_, Option<i64>>(8).unwrap_or(0) as u64;
+ 
+         let amount = Amount::from(amount_val as u64);
+         let keyset_id = match Id::from_str(&keyset_id_str) {
+@@ -965,9 +1004,9 @@ async fn read_proofs_chunk_postgres(
+     options: &MigrationOptions,
+ ) -> Result<Vec<(Proof, Option<QuoteId>, Id, ProofState)>, Error> {
+     let query_str = if spent {
+-        "SELECT amount, id, c, secret, witness, melt_quote FROM proofs_used ORDER BY secret LIMIT $1 OFFSET $2;"
++        "SELECT amount::bigint, id, c, secret, witness, melt_quote FROM proofs_used ORDER BY secret LIMIT $1 OFFSET $2;"
+     } else {
+-        "SELECT amount, id, c, secret, witness, melt_quote FROM proofs_pending pending WHERE NOT EXISTS (SELECT 1 FROM proofs_used used WHERE used.y = pending.y) ORDER BY secret LIMIT $1 OFFSET $2;"
++        "SELECT amount::bigint, id, c, secret, witness, melt_quote FROM proofs_pending pending WHERE NOT EXISTS (SELECT 1 FROM proofs_used used WHERE used.y = pending.y) ORDER BY secret LIMIT $1 OFFSET $2;"
+     };
+     let target_state = if spent {
+         ProofState::Spent
+diff --git a/crates/cdk-sqlite/src/mint/migrate.rs b/crates/cdk-sqlite/src/mint/migrate.rs
+index 55b7e916..afc2224c 100644
+--- a/crates/cdk-sqlite/src/mint/migrate.rs
++++ b/crates/cdk-sqlite/src/mint/migrate.rs
+@@ -92,6 +92,19 @@ fn val_to_string(val: rusqlite::types::Value) -> String {
+     }
+ }
+ 
++fn normalize_lookup_id(raw: Option<&str>, quote: &str) -> String {
++    match raw {
++        Some(value)
++            if !value.is_empty()
++                && !value.eq_ignore_ascii_case("none")
++                && !value.eq_ignore_ascii_case("null") =>
++        {
++            value.to_string()
++        }
++        _ => quote.to_string(),
++    }
++}
++
+ fn source_count(conn: &rusqlite::Connection, table: &str) -> Result<usize, Error> {
+     let sql = format!("SELECT COUNT(*) FROM {table}");
+     conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+@@ -200,8 +213,8 @@ fn validate_nutshell_schema(
+             |row| row.get::<_, i64>(0),
+         )
+         .map_err(|e| Error::Database(Box::new(e)))?;
+-    if version < MIN_SUPPORTED_NUTSHELL_SCHEMA_VERSION
+-        || version > MAX_SUPPORTED_NUTSHELL_SCHEMA_VERSION
++    if !(MIN_SUPPORTED_NUTSHELL_SCHEMA_VERSION..=MAX_SUPPORTED_NUTSHELL_SCHEMA_VERSION)
++        .contains(&version)
+     {
+         if options.allow_unknown_schema {
+             tracing::warn!(
+@@ -220,7 +233,7 @@ fn validate_nutshell_schema(
+ fn validate_melt_quote_lookup_ids(conn: &rusqlite::Connection) -> Result<(), Error> {
+     let duplicate = conn
+         .query_row(
+-            "SELECT checking_id FROM melt_quotes WHERE lower(state) IN ('paid', 'pending') GROUP BY checking_id HAVING COUNT(*) > 1 LIMIT 1",
++            "SELECT checking_id FROM melt_quotes WHERE lower(state) IN ('paid', 'pending') AND checking_id IS NOT NULL AND trim(checking_id) <> '' AND lower(checking_id) NOT IN ('none', 'null') GROUP BY checking_id HAVING COUNT(*) > 1 LIMIT 1",
+             [],
+             |row| row.get::<_, String>(0),
+         )
+@@ -519,12 +532,12 @@ fn read_mint_quotes_chunk_sqlite(
+             let quote: String = row.get(0)?;
+             let method_str: String = row.get(1)?;
+             let request: String = row.get(2)?;
+-            let checking_id: String = row.get(3)?;
++            let checking_id: Option<String> = row.get(3)?;
+             let unit_str: String = row.get(4)?;
+             let amount: i64 = row.get(5)?;
+             let created_time_val = row.get::<_, Option<rusqlite::types::Value>>(6)?;
+             let paid_time_val = row.get::<_, Option<rusqlite::types::Value>>(7)?;
+-            let state_str: String = row.get(8)?;
++            let state_str: Option<String> = row.get(8)?;
+             let pubkey_str: Option<String> = row.get(9)?;
+             let stored_amount_paid: Option<i64> = row.get(10)?;
+             let stored_amount_issued: Option<i64> = row.get(11)?;
+@@ -565,6 +578,11 @@ fn read_mint_quotes_chunk_sqlite(
+                 .unwrap_or_else(cdk_common::util::unix_time);
+             let expiry = created_time + 86400; // default 24h
+ 
++            // Older Nutshell rows use the literal "None" (or NULL) as the
++            // payment lookup id. CDK requires a unique request_lookup_id, so
++            // fall back to the quote id instead of colliding on the placeholder.
++            let checking_id = normalize_lookup_id(checking_id.as_deref(), &quote);
++
+             let request_lookup_id_kind =
+                 if checking_id.len() == 64 && hex::decode(&checking_id).is_ok() {
+                     "payment_hash"
+@@ -585,7 +603,12 @@ fn read_mint_quotes_chunk_sqlite(
+                     }
+                 };
+ 
+-            let state_mapped = match state_str.to_lowercase().as_str() {
++            let state_mapped = match state_str
++                .as_deref()
++                .unwrap_or_default()
++                .to_lowercase()
++                .as_str()
++            {
+                 "paid" | "pending" => MintQuoteState::Paid,
+                 "issued" => MintQuoteState::Issued,
+                 _ => MintQuoteState::Unpaid,
+@@ -679,13 +702,13 @@ fn read_melt_quotes_chunk_sqlite(
+             let quote: String = row.get(0)?;
+             let method_str: String = row.get(1)?;
+             let request_str: String = row.get(2)?;
+-            let checking_id: String = row.get(3)?;
++            let checking_id: Option<String> = row.get(3)?;
+             let unit_str: String = row.get(4)?;
+             let amount: i64 = row.get(5)?;
+             let fee_reserve: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
+             let created_time_val = row.get::<_, Option<rusqlite::types::Value>>(8)?;
+             let paid_time_val = row.get::<_, Option<rusqlite::types::Value>>(9)?;
+-            let state_str: String = row.get(10)?;
++            let state_str: Option<String> = row.get(10)?;
+             let expiry_val = row.get::<_, Option<rusqlite::types::Value>>(11)?;
+             let payment_proof: Option<String> = row.get(12)?;
+ 
+@@ -725,6 +748,7 @@ fn read_melt_quotes_chunk_sqlite(
+                 .map(|t| parse_nutshell_timestamp(t))
+                 .unwrap_or(created_time + 86400);
+             let paid_time = paid_time_str.as_ref().map(|t| parse_nutshell_timestamp(t));
++            let checking_id = normalize_lookup_id(checking_id.as_deref(), &quote);
+ 
+             let request = if let Ok(bolt11) =
+                 lightning_invoice::Bolt11Invoice::from_str(&request_str)
+@@ -751,7 +775,12 @@ fn read_melt_quotes_chunk_sqlite(
+                 Some(PaymentIdentifier::CustomId(checking_id))
+             };
+ 
+-            let state_mapped = match state_str.to_lowercase().as_str() {
++            let state_mapped = match state_str
++                .as_deref()
++                .unwrap_or_default()
++                .to_lowercase()
++                .as_str()
++            {
+                 "paid" => MeltQuoteState::Paid,
+                 "pending" => MeltQuoteState::Pending,
+                 // CDK's persisted melt quote schema has no FAILED state. A
+diff --git a/crates/cdk-sqlite/src/mint/mod.rs b/crates/cdk-sqlite/src/mint/mod.rs
+index c8a2a250..2cc5add6 100644
+--- a/crates/cdk-sqlite/src/mint/mod.rs
++++ b/crates/cdk-sqlite/src/mint/mod.rs
+@@ -6,6 +6,7 @@ use cdk_sql_common::SQLMintDatabase;
+ use crate::common::SqliteConnectionManager;
+ 
+ pub mod memory;
++/// Nutshell to CDK migration support.
+ pub mod migrate;
+ 
+ /// Mint SQLite implementation with rusqlite
+diff --git a/docs/nutshell-migration.md b/docs/nutshell-migration.md
+index a7c2f13b..86695e1a 100644
+--- a/docs/nutshell-migration.md
++++ b/docs/nutshell-migration.md
+@@ -52,6 +52,26 @@ without writing:
+ cdk-mintd migrate-nutshell --source ... --target ... --verify-only
+ ```
+ 
++The verification checks row counts, quote accounting, promise ordering, and
++per-keyset liabilities. It does not re-hash the public keys the mint will serve.
++Start the mint and fetch `/v1/keys/{id}` for every advertised keyset, then
++recompute the NUT-02 id from the served keys and compare it with the advertised
++id. A truncated or incomplete amount list keeps every key correct but changes
++the hash.
++
++## Historical data
++
++The migrator reads common historical data tolerantly:
++
++- NULL quote states are treated as UNPAID.
++- NULL, empty, or literal `None` payment lookup ids fall back to the quote id.
++- int4 `amount`/`fee_reserve` columns are read through `::bigint` on PostgreSQL.
++- An empty keyset `amounts` list falls back to 64 denominations.
++- Melt-quote expiry beyond the int4 (2038) ceiling is clamped.
++
++Duplicate paid/pending melt quotes with a real payment id still abort. Resolve
++them on the source copy before migrating.
++
+ ## After migration
+ 
+ Initialize the database-backed configuration with the original seed:
+-- 
+2.50.1.windows.1
+
