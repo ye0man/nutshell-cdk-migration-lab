@@ -21,10 +21,10 @@ Start with:
 
 | Run | Nutshell | Schema | Database | Result |
 |---|---|---|---|---|
-| S1 | 0.22.0 tag (self-reports 0.21.0) | 42 | SQLite | Pass |
+| S1 | 0.22.0 tag (keysets report 0.21.0) | 42 | SQLite | Pass |
 | S2 | 0.22.0 tag | 42 | PostgreSQL | Pass |
 | S3 | 0.22.0 tag | 42 | SQLite, sat/usd/eur | Pass |
-| S9 | 0.22.1 | 42 | SQLite | Pass |
+| S9 | 0.22.1 (fixed version bump) | 42 | SQLite | Pass |
 | S7 | 0.20.3 | 38 | SQLite, raw seed | Pass |
 | S8 | 0.21.0 | 39 | SQLite, raw seed | Pass |
 
@@ -76,5 +76,6 @@ Binary: `patched-cdk/target/debug/cdk-mintd.exe`.
 
 - The migration subcommand is not in the stock CDK v0.18.3 release.
 - LND, CLN, Strike, Spark, NUT-21 auth, and large-volume timing were not tested.
-- Nutshell 0.22.0 was published without a version bump; 0.22.1 fixes it and is the release to use.
+- Nutshell 0.22.0 was published without a version bump; S1-S3 were run on that
+  tag and its keysets report 0.21.0. 0.22.1 fixes the bump (S9); use 0.22.1.
 - Do not migrate a live database. Freeze, back up, verify, then reopen.

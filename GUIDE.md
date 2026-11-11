@@ -33,8 +33,8 @@ Prebuilt binaries are produced by
 
 | Area | Result |
 |---|---|
-| Nutshell 0.22.1 (schema 42) | Migrated, verified |
-| Nutshell 0.22.0 tag (schema 42) | Migrated, verified |
+| Nutshell 0.22.1 (recommended; schema 42) | Migrated, verified |
+| Nutshell 0.22.0 tag (keysets report 0.21.0; schema 42) | Migrated, verified |
 | Nutshell 0.21.0 (schema 39) | Migrated, verified |
 | Nutshell 0.20.3 (schema 38) | Migrated, verified |
 | SQLite source and target | Verified |
